@@ -1,0 +1,47 @@
+name: sana-env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.4.1
+  - torchvision=0.19.1
+  - torchaudio=2.4.1
+  - pytorch-cuda=12.1
+  - pip
+  - git
+  - git-lfs
+  - ninja
+  - cmake
+  - numpy=1.26.4
+  - scipy
+  - pandas
+  - matplotlib
+  - scikit-image
+  - scikit-learn
+  - pillow
+  - tqdm
+  - pyyaml
+  - omegaconf
+  - opencv
+  - tensorboard
+  - ipykernel
+  - pip:
+      - diffusers>=0.32.0,<0.36
+      - transformers>=4.44,<4.50
+      - accelerate>=0.30,<1
+      - safetensors>=0.4
+      - huggingface_hub>=0.24
+      - sentencepiece
+      - einops
+      - lpips
+      - pytorch-wavelets
+      - easyocr
+      - facenet-pytorch
+      - rich
+      - pytest
+      - pytest-xdist
+      - black
+      - ruff
+      - mypy

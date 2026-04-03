@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Block obvious large binary commits.
+if git diff --cached --name-only | grep -E '(\.pt$|\.pth$|\.ckpt$|\.safetensors$|\.npz$|\.npy$|^outputs/|^checkpoints/|^data/raw/)' >/dev/null; then
+  echo "pre-commit: refusing to commit checkpoints, raw data, or outputs."
+  exit 1
+fi
+
+# Basic Python syntax check on staged files.
+PY_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' || true)
+if [ -n "$PY_FILES" ]; then
+  python -m py_compile $PY_FILES
+fi

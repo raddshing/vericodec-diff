@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "baselines": [
+    {
+      "id": "d2it",
+      "name": "Dynamic-DiT (D2iT)",
+      "upstream_url": "https://github.com/jiawn-creator/Dynamic-DiT.git",
+      "default_branch": "main",
+      "pinned_commit": "1c3973c7d8492693723980fc3f8a7e9b83d4c5e7",
+      "local_checkout_path": "baselines/external/jiawn-creator_dynamic-dit",
+      "status": "use_proxy",
+      "expected_weights": [],
+      "entrypoints": [],
+      "environment_notes": [
+        "Official checkout has no environment file or setup instructions.",
+        "Use the RAS checkout as the runnable fallback until upstream releases code."
+      ],
+      "reason": "Official checkout contains only README.md with 'Coming soon!' and no runnable code, setup files, scripts, or released weights.",
+      "proxy_baseline_id": "ras",
+      "proxy_checkout_path": "baselines/external/microsoft_ras"
+    },
+    {
+      "id": "ect",
+      "name": "ECT",
+      "upstream_url": "https://github.com/locuslab/ect.git",
+      "default_branch": "main",
+      "pinned_commit": "4311059770f54821d151a9b0e1f76770a5f3930e",
+      "local_checkout_path": "baselines/external/locuslab_ect",
+      "status": "available",
+      "expected_weights": [
+        "https://drive.google.com/file/d/1WN_eLTrcl-vB7fMc1HADpacgcO4SNJ_1/view?usp=sharing"
+      ],
+      "entrypoints": [
+        "run_ecm_1hour.sh",
+        "run_ecm.sh",
+        "eval_ecm.sh"
+      ],
+      "environment_notes": [
+        "Upstream README and env.yml target Python 3.9.18 and PyTorch 2.3.0.",
+        "Pinned local checkout is the `main` branch for CIFAR-10; upstream also documents an `imgnet` branch for ImageNet 64x64.",
+        "Repo-local environment/ect-env.yaml is the closest tracked environment match."
+      ],
+      "reason": null,
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    },
+    {
+      "id": "efficientvit",
+      "name": "EfficientViT / DC-AE",
+      "upstream_url": "https://github.com/mit-han-lab/efficientvit.git",
+      "default_branch": "master",
+      "pinned_commit": "de7d7733cc0329f391b33f1f459271562ec27bd5",
+      "local_checkout_path": "baselines/external/mit-han-lab_efficientvit",
+      "status": "available",
+      "expected_weights": [
+        "mit-han-lab/dc-ae-f32c32-in-1.0-diffusers",
+        "mit-han-lab/dc-ae-f64c128-in-1.0-diffusers",
+        "mit-han-lab/dc-ae-f128c512-in-1.0-diffusers"
+      ],
+      "entrypoints": [
+        "applications/dc_ae/demo_dc_ae_model_diffusers.py",
+        "applications/dc_ae/demo_dc_ae_diffusion_model.py",
+        "applications/dc_ae/eval_dc_ae_model.py",
+        "applications/dc_ae/eval_dc_ae_diffusion_model.py",
+        "applications/dc_ae/train_dc_ae_diffusion_model.py"
+      ],
+      "environment_notes": [
+        "Upstream README suggests `conda create -n efficientvit python=3.10` then `pip install -U -r requirements.txt`.",
+        "No dedicated repo-local environment YAML exists for EfficientViT or DC-AE."
+      ],
+      "reason": null,
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    },
+    {
+      "id": "ras",
+      "name": "RAS",
+      "upstream_url": "https://github.com/microsoft/RAS.git",
+      "default_branch": "main",
+      "pinned_commit": "a9c5ec8fb2147ef450a7e3b5ec3b7bdd0006de3f",
+      "local_checkout_path": "baselines/external/microsoft_ras",
+      "status": "available",
+      "expected_weights": [
+        "stabilityai/stable-diffusion-3-medium-diffusers",
+        "Alpha-VLLM/Lumina-Next-SFT-diffusers"
+      ],
+      "entrypoints": [
+        "scripts/Stable_Diffusion_3_example.sh",
+        "scripts/Lumina_Next_T2I_example.sh"
+      ],
+      "environment_notes": [
+        "Upstream README suggests `conda create -n ras python=3.12`, `python setup.py install`, and `pip install flash-attn --no-build-isolation`.",
+        "The Stable Diffusion 3 example in the README uses `use_auth_token=True` for the upstream model load.",
+        "PyCuda is only needed when enabling index fusion."
+      ],
+      "reason": null,
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    },
+    {
+      "id": "sana",
+      "name": "Sana",
+      "upstream_url": "https://github.com/NVlabs/Sana.git",
+      "default_branch": "main",
+      "pinned_commit": "0e62d975d5e1357226131f78d15b544f94875b76",
+      "local_checkout_path": "baselines/external/nvlabs_sana",
+      "status": "available",
+      "expected_weights": [
+        "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers"
+      ],
+      "entrypoints": [
+        "environment_setup.sh",
+        "app/app_sana.py"
+      ],
+      "environment_notes": [
+        "Upstream quick start uses `./environment_setup.sh sana`.",
+        "Repo-local environment/sana-env.yaml already includes diffusers support for SanaPipeline."
+      ],
+      "reason": null,
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    }
+  ]
+}

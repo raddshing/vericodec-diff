@@ -1,0 +1,37 @@
+paths:
+  repo_root: .
+  output_dir: logs/tests
+  disk_checks:
+    - name: repo_root
+      path: .
+      must_exist: true
+    - name: data_root
+      path: /mnt/data/vericodec-diff
+      must_exist: false
+
+packages:
+  environment_files:
+    - environment/sana-env.yaml
+    - environment/ect-env.yaml
+  exclude_names:
+    - python
+    - pip
+    - git
+    - git-lfs
+    - ninja
+    - cmake
+    - pytorch-cuda
+  distribution_candidates:
+    pytorch:
+      - torch
+    pillow:
+      - Pillow
+    pyyaml:
+      - PyYAML
+    opencv:
+      - opencv-python
+      - opencv-python-headless
+      - opencv-contrib-python
+
+# Add local checkpoint paths here when a run should require them.
+checkpoints: []

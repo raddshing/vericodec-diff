@@ -14,12 +14,17 @@ from vericodec_diff.patch_metrics import (
     DEFAULT_PATCH_SIZE,
     PATCH_COUNT,
     PATCH_ERROR_SUFFIX,
-    PATCH_METRIC_NAMES,
     deep_update,
     display_path,
     parse_csv_items,
     resolve_path,
     validate_patch_metric_array,
+)
+from vericodec_diff.patch_error_targets import (
+    PATCH_ERROR_METRIC_NAME,
+    SUPPORTED_SPARSITY_METRIC_NAMES,
+    SUPPORTED_VERIFIER_LABEL_METRIC_NAMES,
+    patch_metric_source_command,
 )
 from vericodec_diff.sparsity_stats import concentration_at_percent, gini_coefficient
 from vericodec_diff.verifier_features import DEFAULT_SIGNAL_NAMES, SIGNAL_SUFFIX
@@ -27,7 +32,7 @@ from vericodec_diff.verifier_features import DEFAULT_SIGNAL_NAMES, SIGNAL_SUFFIX
 
 VERIFIER_CHECKPOINT_VERSION = 1
 VERIFIER_EVAL_VERSION = 1
-KILL_MEMO_VERSION = 2
+KILL_MEMO_VERSION = 3
 CHECKPOINT_INDEX_FILENAME = "checkpoint_index__patch64.json"
 TRAINING_SUMMARY_FILENAME = "training_summary__patch64.json"
 EVAL_JSON_FILENAME = "verifier_eval__patch64.json"
@@ -265,6 +270,9 @@ def default_kill_memo_config() -> dict[str, Any]:
             "memo_md_path": DEFAULT_MEMO_MD_PATH,
             "memo_json_path": DEFAULT_MEMO_JSON_PATH,
         },
+        "metrics": {
+            "sparsity_metric_name": PATCH_ERROR_METRIC_NAME,
+        },
         "thresholds": {
             "concentration_at_15_min": None,
             "gini_mean_min": None,
@@ -310,8 +318,8 @@ def resolve_verifier_train_config(repo_root: Path, raw_config: Mapping[str, Any]
         raise ValueError("data.limit must be a positive integer when provided")
 
     label_metric_name = str(labels.get("metric_name", "lpips")).strip()
-    if label_metric_name not in PATCH_METRIC_NAMES:
-        raise ValueError(f"labels.metric_name must be one of {PATCH_METRIC_NAMES}")
+    if label_metric_name not in SUPPORTED_VERIFIER_LABEL_METRIC_NAMES:
+        raise ValueError(f"labels.metric_name must be one of {SUPPORTED_VERIFIER_LABEL_METRIC_NAMES}")
     label_threshold = float(labels.get("threshold", 0.05))
     if label_threshold < 0.0:
         raise ValueError("labels.threshold must be non-negative")
@@ -424,8 +432,8 @@ def resolve_verifier_eval_config(repo_root: Path, raw_config: Mapping[str, Any])
         raise ValueError("data.limit must be a positive integer when provided")
 
     label_metric_name = str(labels.get("metric_name", "lpips")).strip()
-    if label_metric_name not in PATCH_METRIC_NAMES:
-        raise ValueError(f"labels.metric_name must be one of {PATCH_METRIC_NAMES}")
+    if label_metric_name not in SUPPORTED_VERIFIER_LABEL_METRIC_NAMES:
+        raise ValueError(f"labels.metric_name must be one of {SUPPORTED_VERIFIER_LABEL_METRIC_NAMES}")
     label_threshold = float(labels.get("threshold", 0.05))
     if label_threshold < 0.0:
         raise ValueError("labels.threshold must be non-negative")
@@ -460,6 +468,7 @@ def resolve_verifier_eval_config(repo_root: Path, raw_config: Mapping[str, Any])
 def resolve_kill_memo_config(repo_root: Path, raw_config: Mapping[str, Any]) -> dict[str, Any]:
     config = deep_update(default_kill_memo_config(), raw_config)
     paths = dict(config.get("paths", {}))
+    metrics = dict(config.get("metrics", {}))
     thresholds = dict(config.get("thresholds", {}))
 
     resolved_repo_root = resolve_path(repo_root, str(paths.get("repo_root", "."))).resolve()
@@ -494,6 +503,10 @@ def resolve_kill_memo_config(repo_root: Path, raw_config: Mapping[str, Any]) -> 
         name="paths.memo_json_path",
     )
 
+    sparsity_metric_name = str(metrics.get("sparsity_metric_name", PATCH_ERROR_METRIC_NAME)).strip()
+    if sparsity_metric_name not in SUPPORTED_SPARSITY_METRIC_NAMES:
+        raise ValueError(f"metrics.sparsity_metric_name must be one of {SUPPORTED_SPARSITY_METRIC_NAMES}")
+
     return {
         "paths": {
             "repo_root": str(resolved_repo_root),
@@ -503,6 +516,9 @@ def resolve_kill_memo_config(repo_root: Path, raw_config: Mapping[str, Any]) -> 
             "output_dir": str(output_dir),
             "memo_md_path": str(memo_md_path),
             "memo_json_path": str(memo_json_path),
+        },
+        "metrics": {
+            "sparsity_metric_name": sparsity_metric_name,
         },
         "thresholds": {
             "concentration_at_15_min": _parse_optional_probability_threshold(
@@ -617,7 +633,7 @@ def _load_label_metric_values(path: Path, *, metric_name: str) -> tuple[str, str
             )
         if metric_name not in payload.files:
             raise VerifierDatasetError(
-                f"{path}: missing patch metric {metric_name!r}; re-run compute_patch_errors.py with matching settings"
+                f"{path}: missing patch metric {metric_name!r}; run {patch_metric_source_command(metric_name)} first"
             )
         values = validate_patch_metric_array(payload[metric_name], metric_name=f"{path.name}:{metric_name}")
         sample_id = _scalar_string(payload["sample_id"])
@@ -1592,7 +1608,7 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
     failure_sparsity = _compute_failure_sparsity_summary(
         error_map_root=error_map_root,
         selected_splits=test_splits,
-        metric_name=str(label_definition["metric_name"]),
+        metric_name=str(config["metrics"]["sparsity_metric_name"]),
     )
     best_model_auprc = float(best_model_metrics["auprc"])
     heuristic_auprc = float(heuristic_metrics["auprc"])
@@ -1717,6 +1733,9 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
             "measured_concentration_at_15": measured_metrics["generation_proxy_concentration_at_15"],
         },
         "measured": measured_metrics,
+        "metrics": {
+            "sparsity_metric_name": str(config["metrics"]["sparsity_metric_name"]),
+        },
         "thresholds": {
             "concentration_at_15_min": concentration_at_15_min,
             "gini_mean_min": gini_mean_min,
@@ -1742,6 +1761,7 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
         "",
         "## Measured Metrics",
         "",
+        f"- Failure sparsity metric: `{failure_sparsity['metric_name']}`",
         f"- Failure concentration at 15%: `{measured_metrics['failure_concentration_at_15']}`",
         f"- Failure Gini mean: `{measured_metrics['failure_gini_mean']}`",
         f"- Verifier test AUPRC: `{measured_metrics['verifier_test_auprc']}`",

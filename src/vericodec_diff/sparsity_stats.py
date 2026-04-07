@@ -21,6 +21,10 @@ from vericodec_diff.patch_metrics import (
     resolve_path,
     validate_patch_metric_array,
 )
+from vericodec_diff.patch_error_targets import (
+    SUPPORTED_SPARSITY_METRIC_NAMES,
+    patch_metric_source_command,
+)
 
 
 SPARSITY_SUMMARY_VERSION = 1
@@ -87,10 +91,12 @@ def resolve_sparsity_stats_config(repo_root: Path, raw_config: Mapping[str, Any]
     if limit is not None and limit <= 0:
         raise ValueError("data.limit must be a positive integer when provided")
 
-    metric_names = [str(name).strip() for name in data.get("metric_names", PATCH_METRIC_NAMES) if str(name).strip()]
+    metric_names = parse_csv_items(data.get("metric_names"))
+    if not metric_names:
+        metric_names = list(PATCH_METRIC_NAMES)
     if not metric_names:
         raise ValueError("data.metric_names must contain at least one metric name")
-    unsupported_metrics = [name for name in metric_names if name not in PATCH_METRIC_NAMES]
+    unsupported_metrics = [name for name in metric_names if name not in SUPPORTED_SPARSITY_METRIC_NAMES]
     if unsupported_metrics:
         raise ValueError(f"Unsupported patch metrics requested: {unsupported_metrics}")
 
@@ -169,10 +175,11 @@ def load_patch_error_npz(path: Path, *, metric_names: Sequence[str]) -> dict[str
                 f"{path}: expected patch grid {(DEFAULT_GRID_SIZE, DEFAULT_GRID_SIZE)}, found {(grid_height, grid_width)}"
             )
 
-        metrics = {
-            name: validate_patch_metric_array(payload[name], metric_name=f"{path.name}:{name}")
-            for name in metric_names
-        }
+        metrics: dict[str, np.ndarray] = {}
+        for name in metric_names:
+            if name not in payload.files:
+                raise ValueError(f"{path}: missing patch metric {name!r}; run {patch_metric_source_command(name)} first")
+            metrics[name] = validate_patch_metric_array(payload[name], metric_name=f"{path.name}:{name}")
         return {
             "sample_id": _scalar_string(payload["sample_id"]),
             "split": _scalar_string(payload["split"]),

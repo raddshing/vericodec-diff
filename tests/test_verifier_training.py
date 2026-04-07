@@ -23,6 +23,11 @@ from vericodec_diff.patch_metrics import (
     build_patch_error_payload,
     write_patch_error_npz,
 )
+from vericodec_diff.patch_error_targets import (
+    PATCH_ERROR_METRIC_NAME,
+    PATCH_LABEL_TOP15_NAME,
+    augment_patch_error_payload,
+)
 from vericodec_diff.verifier_features import (
     DEFAULT_SIGNAL_NAMES,
     VerifierSampleRecord,
@@ -48,12 +53,15 @@ def _make_signal_arrays(offset: int) -> tuple[dict[str, np.ndarray], np.ndarray]
     group_b = ((indices.astype(np.int32) + offset) % 16) == 8
     decoy_a = ((indices.astype(np.int32) + offset) % 16) == 4
     decoy_b = ((indices.astype(np.int32) + offset) % 16) == 12
-    labels = np.logical_or(group_a, group_b)
+    negative_candidates = np.flatnonzero(~np.logical_or(group_a, group_b))
+    group_c = np.zeros(PATCH_COUNT, dtype=bool)
+    group_c[np.roll(negative_candidates, offset)[:7]] = True
+    labels = np.logical_or(np.logical_or(group_a, group_b), group_c)
 
-    signal_a = np.where(np.logical_or(group_a, decoy_a), 2.6, 0.05).astype(np.float32)
+    signal_a = np.where(np.logical_or(np.logical_or(group_a, group_c), decoy_a), 2.6, 0.05).astype(np.float32)
     signal_a += 0.02 * np.sin(indices * 0.31 + float(offset)).astype(np.float32)
 
-    signal_b = np.where(np.logical_or(group_b, decoy_b), 2.6, 0.05).astype(np.float32)
+    signal_b = np.where(np.logical_or(np.logical_or(group_b, group_c), decoy_b), 2.6, 0.05).astype(np.float32)
     signal_b += 0.02 * np.cos(indices * 0.27 + float(offset)).astype(np.float32)
 
     decoy_signal = np.where(np.logical_or(decoy_a, decoy_b), 2.8, 0.05).astype(np.float32)
@@ -76,8 +84,10 @@ def _make_signal_arrays(offset: int) -> tuple[dict[str, np.ndarray], np.ndarray]
         ).astype(np.float32),
     }
 
-    metric_values = np.where(labels, 0.12, 0.01).astype(np.float32)
-    metric_values[group_a] += np.float32(0.06)
+    metric_values = np.full(PATCH_COUNT, 0.01, dtype=np.float32)
+    metric_values[group_a] = np.float32(0.18)
+    metric_values[group_b] = np.float32(0.12)
+    metric_values[group_c] = np.float32(0.10)
     return signal_arrays, metric_values
 
 
@@ -129,6 +139,7 @@ def _write_feature_and_error_artifacts(repo_root: Path, *, split: str, sample_id
         lpips_backend="pixel_l2_debug",
         wavelet="haar",
     )
+    error_payload = augment_patch_error_payload(error_payload)
     write_patch_error_npz(
         repo_root / "outputs" / "error_maps" / split / f"{sample_id}__patch64.npz",
         error_payload,
@@ -150,6 +161,7 @@ class VerifierTrainingTests(unittest.TestCase):
 
         resolved = resolve_kill_memo_config(REPO_ROOT, raw_config)
 
+        self.assertEqual(resolved["metrics"], {"sparsity_metric_name": PATCH_ERROR_METRIC_NAME})
         self.assertEqual(
             resolved["thresholds"],
             {
@@ -179,6 +191,10 @@ class VerifierTrainingTests(unittest.TestCase):
                 "logistic,mlp",
                 "--models-seed",
                 "11",
+                "--label-metric-name",
+                PATCH_LABEL_TOP15_NAME,
+                "--label-threshold",
+                "0.5",
                 "--logistic-learning-rate",
                 "0.2",
                 "--logistic-epochs",
@@ -197,6 +213,10 @@ class VerifierTrainingTests(unittest.TestCase):
                 str(EVAL_SCRIPT),
                 "--repo-root",
                 tmpdir,
+                "--label-metric-name",
+                PATCH_LABEL_TOP15_NAME,
+                "--label-threshold",
+                "0.5",
             ]
             subprocess.run(eval_command, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
 
@@ -205,6 +225,8 @@ class VerifierTrainingTests(unittest.TestCase):
                 str(MEMO_SCRIPT),
                 "--repo-root",
                 tmpdir,
+                "--sparsity-metric-name",
+                PATCH_ERROR_METRIC_NAME,
             ]
             subprocess.run(memo_command, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
 
@@ -237,6 +259,8 @@ class VerifierTrainingTests(unittest.TestCase):
 
             with eval_json_path.open("r", encoding="utf-8") as handle:
                 evaluation = json.load(handle)
+            self.assertEqual(evaluation["label_definition"]["metric_name"], PATCH_LABEL_TOP15_NAME)
+            self.assertEqual(evaluation["label_definition"]["threshold"], 0.5)
             self.assertGreater(evaluation["best_model"]["test_metrics"]["auprc"], 0.95)
             self.assertGreater(
                 evaluation["best_model"]["test_metrics"]["auprc"],
@@ -253,6 +277,9 @@ class VerifierTrainingTests(unittest.TestCase):
                 memo = json.load(handle)
             self.assertEqual(memo["decision"], "GO")
             self.assertTrue(all(check["passed"] for check in memo["checks"]))
+            self.assertEqual(memo["label_definition"]["metric_name"], PATCH_LABEL_TOP15_NAME)
+            self.assertEqual(memo["failure_sparsity"]["metric_name"], PATCH_ERROR_METRIC_NAME)
+            self.assertEqual(memo["metrics"], {"sparsity_metric_name": PATCH_ERROR_METRIC_NAME})
             self.assertEqual(
                 {check["name"] for check in memo["checks"]},
                 {
@@ -282,6 +309,7 @@ class VerifierTrainingTests(unittest.TestCase):
             memo_text = memo_md_path.read_text(encoding="utf-8")
             self.assertIn("Decision: **GO**", memo_text)
             self.assertIn("## Gate Checks", memo_text)
+            self.assertIn("Failure sparsity metric", memo_text)
             self.assertIn("Failure concentration at 15%", memo_text)
 
     def test_eval_script_saves_resolved_config_before_missing_checkpoint_failure(self) -> None:

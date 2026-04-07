@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metric-names",
         default=None,
-        help="Optional comma-separated metric list drawn from lpips,one_minus_ssim,hf_wavelet_l1.",
+        help="Optional comma-separated metric list drawn from lpips,one_minus_ssim,hf_wavelet_l1,patch_error.",
     )
     parser.add_argument(
         "--limit",

@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
         help="Repo-relative or absolute JSON memo output path.",
     )
     parser.add_argument(
+        "--sparsity-metric-name",
+        default=None,
+        help="Continuous patch metric used for concentration and Gini, for example patch_error.",
+    )
+    parser.add_argument(
         "--concentration-at-15-min",
         type=float,
         default=None,
@@ -126,6 +131,9 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict[str, object]:
         value = getattr(args, arg_name)
         if value is not None:
             overrides["paths"][config_key] = value
+
+    if args.sparsity_metric_name is not None:
+        overrides["metrics"] = {"sparsity_metric_name": args.sparsity_metric_name}
 
     threshold_overrides: dict[str, object] = {}
     for arg_name, config_key in (

@@ -67,7 +67,10 @@ def parse_args() -> argparse.Namespace:
         "--count-override",
         action="append",
         default=[],
-        help="Repeatable split=count override, for example --count-override kill=2.",
+        help=(
+            "Repeatable split=count or split:category=count override, "
+            "for example --count-override kill=2 or --count-override kill:text=300."
+        ),
     )
     return parser.parse_args()
 
@@ -91,8 +94,11 @@ def main() -> int:
         }
     )
     for override in args.count_override:
-        split, count = parse_count_override(override)
-        raw_config["dataset"]["split_counts"][split] = count
+        split, category, count = parse_count_override(override)
+        if category is None:
+            raw_config["dataset"]["split_counts"][split] = count
+            continue
+        raw_config["dataset"].setdefault("category_split_counts", {}).setdefault(split, {})[category] = count
 
     config = resolve_generation_config(REPO_ROOT, raw_config)
     output_dir = Path(config["paths"]["output_dir"])

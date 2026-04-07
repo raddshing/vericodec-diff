@@ -19,6 +19,14 @@ SYNTHETIC_CATEGORIES = (
     "thin-boundary",
     "repeated-pattern",
 )
+CATEGORY_ALIASES = {
+    "text": "text-posters-signs",
+    "text-posters-signs": "text-posters-signs",
+    "boundary": "thin-boundary",
+    "thin-boundary": "thin-boundary",
+    "pattern": "repeated-pattern",
+    "repeated-pattern": "repeated-pattern",
+}
 LOCKED_SPLIT_COUNTS = {
     "kill": 48,
     "main": 100,
@@ -89,6 +97,7 @@ def default_generation_config() -> dict[str, Any]:
             "splits": list(LOCKED_SPLIT_COUNTS),
             "categories": list(SYNTHETIC_CATEGORIES),
             "split_counts": deepcopy(LOCKED_SPLIT_COUNTS),
+            "category_split_counts": {},
         },
     }
 
@@ -154,6 +163,34 @@ def resolve_generation_config(repo_root: Path, raw_config: Mapping[str, Any]) ->
             raise ValueError(f"split_counts[{split!r}] must be non-negative")
         split_counts[split] = count
 
+    raw_category_split_counts = dict(dataset.get("category_split_counts", {}))
+    category_split_counts: dict[str, dict[str, int]] = {}
+    for split, raw_counts in raw_category_split_counts.items():
+        split_name = str(split)
+        if split_name not in LOCKED_SPLIT_COUNTS:
+            raise ValueError(f"Unsupported split in category_split_counts: {split_name!r}")
+        if split_name not in splits:
+            raise ValueError(f"category_split_counts[{split_name!r}] references an unselected split")
+        if not isinstance(raw_counts, Mapping):
+            raise ValueError(f"category_split_counts[{split_name!r}] must be a mapping")
+        normalized_counts: dict[str, int] = {}
+        for category, count_value in dict(raw_counts).items():
+            category_name = str(category)
+            if category_name not in SYNTHETIC_CATEGORIES:
+                raise ValueError(f"Unsupported category in category_split_counts: {category_name!r}")
+            if category_name not in categories:
+                raise ValueError(
+                    f"category_split_counts[{split_name!r}] references an unselected category {category_name!r}"
+                )
+            count = int(count_value)
+            if count < 0:
+                raise ValueError(
+                    f"category_split_counts[{split_name!r}][{category_name!r}] must be non-negative"
+                )
+            normalized_counts[category_name] = count
+        if normalized_counts:
+            category_split_counts[split_name] = normalized_counts
+
     return {
         "paths": {
             "repo_root": str(resolved_repo_root),
@@ -167,6 +204,7 @@ def resolve_generation_config(repo_root: Path, raw_config: Mapping[str, Any]) ->
             "splits": splits,
             "categories": categories,
             "split_counts": split_counts,
+            "category_split_counts": category_split_counts,
         },
     }
 
@@ -175,17 +213,34 @@ def parse_csv_items(raw_value: str) -> list[str]:
     return [item.strip() for item in raw_value.split(",") if item.strip()]
 
 
-def parse_count_override(raw_value: str) -> tuple[str, int]:
-    split, separator, count_text = raw_value.partition("=")
+def normalize_synthetic_category(raw_value: str) -> str:
+    category = raw_value.strip()
+    if category not in CATEGORY_ALIASES:
+        raise ValueError(f"Unsupported synthetic category alias: {raw_value!r}")
+    return CATEGORY_ALIASES[category]
+
+
+def parse_count_override(raw_value: str) -> tuple[str, str | None, int]:
+    target, separator, count_text = raw_value.partition("=")
     if separator != "=":
-        raise ValueError(f"Count override must look like split=count, received {raw_value!r}")
-    split = split.strip()
+        raise ValueError(f"Count override must look like split=count or split:category=count, received {raw_value!r}")
+    split, category_separator, category = target.strip().partition(":")
     if split not in LOCKED_SPLIT_COUNTS:
         raise ValueError(f"Unsupported split in count override: {split!r}")
+    normalized_category = None
+    if category_separator == ":":
+        if not category.strip():
+            raise ValueError(f"Missing category in count override: {raw_value!r}")
+        normalized_category = normalize_synthetic_category(category)
     count = int(count_text.strip())
     if count < 0:
         raise ValueError("Count override must be non-negative")
-    return split, count
+    return split, normalized_category, count
+
+
+def count_for_split_and_category(config: Mapping[str, Any], split: str, category: str) -> int:
+    category_split_counts = config["dataset"].get("category_split_counts", {})
+    return int(category_split_counts.get(split, {}).get(category, config["dataset"]["split_counts"][split]))
 
 
 def build_image_id(split: str, category: str, index: int) -> str:
@@ -207,8 +262,8 @@ def build_generation_plan(config: Mapping[str, Any]) -> list[dict[str, Any]]:
 
     plan: list[dict[str, Any]] = []
     for split in dataset["splits"]:
-        count = int(dataset["split_counts"][split])
         for category in dataset["categories"]:
+            count = count_for_split_and_category(config, split, category)
             for index in range(1, count + 1):
                 image_id = build_image_id(split, category, index)
                 seed = derive_image_seed(int(dataset["base_seed"]), split, category, index)
@@ -654,19 +709,21 @@ def validate_synthetic_manifest(
     if config is not None:
         selected_categories = list(config["dataset"]["categories"])
         selected_splits = list(config["dataset"]["splits"])
-        expected_total = sum(int(config["dataset"]["split_counts"][split]) for split in selected_splits) * len(
-            selected_categories
+        expected_total = sum(
+            count_for_split_and_category(config, split, category)
+            for split in selected_splits
+            for category in selected_categories
         )
         if len(rows) != expected_total:
             raise SyntheticManifestValidationError(
                 f"{manifest_path.name}: expected {expected_total} rows, found {len(rows)}"
             )
         expected_category_counts = {
-            category: sum(int(config["dataset"]["split_counts"][split]) for split in selected_splits)
+            category: sum(count_for_split_and_category(config, split, category) for split in selected_splits)
             for category in selected_categories
         }
         expected_split_counts = {
-            split: int(config["dataset"]["split_counts"][split]) * len(selected_categories)
+            split: sum(count_for_split_and_category(config, split, category) for category in selected_categories)
             for split in selected_splits
         }
         if dict(category_counts) != expected_category_counts:

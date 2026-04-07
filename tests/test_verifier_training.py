@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +33,7 @@ from vericodec_diff.verifier_training import (
     BUDGET_CURVES_FILENAME,
     CHECKPOINT_INDEX_FILENAME,
     EVAL_JSON_FILENAME,
+    resolve_kill_memo_config,
 )
 
 
@@ -44,25 +46,38 @@ def _make_signal_arrays(offset: int) -> tuple[dict[str, np.ndarray], np.ndarray]
     indices = np.arange(PATCH_COUNT, dtype=np.float32)
     group_a = ((indices.astype(np.int32) + offset) % 16) == 0
     group_b = ((indices.astype(np.int32) + offset) % 16) == 8
+    decoy_a = ((indices.astype(np.int32) + offset) % 16) == 4
+    decoy_b = ((indices.astype(np.int32) + offset) % 16) == 12
     labels = np.logical_or(group_a, group_b)
 
-    signal_a = np.where(group_a, 2.5, 0.05).astype(np.float32)
+    signal_a = np.where(np.logical_or(group_a, decoy_a), 2.6, 0.05).astype(np.float32)
     signal_a += 0.02 * np.sin(indices * 0.31 + float(offset)).astype(np.float32)
 
-    signal_b = np.where(group_b, 2.5, 0.05).astype(np.float32)
+    signal_b = np.where(np.logical_or(group_b, decoy_b), 2.6, 0.05).astype(np.float32)
     signal_b += 0.02 * np.cos(indices * 0.27 + float(offset)).astype(np.float32)
+
+    decoy_signal = np.where(np.logical_or(decoy_a, decoy_b), 2.8, 0.05).astype(np.float32)
+    decoy_signal += 0.02 * np.sin(indices * 0.17 + float(offset)).astype(np.float32)
 
     signal_arrays = {
         DEFAULT_SIGNAL_NAMES[0]: signal_a,
         DEFAULT_SIGNAL_NAMES[1]: signal_b,
-        DEFAULT_SIGNAL_NAMES[2]: (0.10 + 0.08 * np.sin(indices * 0.11 + float(offset))).astype(np.float32),
-        DEFAULT_SIGNAL_NAMES[3]: (2.80 - signal_a + 0.03 * np.cos(indices * 0.07)).astype(np.float32),
-        DEFAULT_SIGNAL_NAMES[4]: (2.80 - signal_b + 0.03 * np.sin(indices * 0.09)).astype(np.float32),
-        DEFAULT_SIGNAL_NAMES[5]: (0.05 + (indices % 9.0) / 9.0).astype(np.float32),
+        DEFAULT_SIGNAL_NAMES[2]: decoy_signal,
+        DEFAULT_SIGNAL_NAMES[3]: np.clip(2.80 - signal_a + 0.03 * np.cos(indices * 0.07), 0.0, None).astype(
+            np.float32
+        ),
+        DEFAULT_SIGNAL_NAMES[4]: np.clip(2.80 - signal_b + 0.03 * np.sin(indices * 0.09), 0.0, None).astype(
+            np.float32
+        ),
+        DEFAULT_SIGNAL_NAMES[5]: np.clip(
+            2.80 - decoy_signal + 0.03 * np.cos(indices * 0.05),
+            0.0,
+            None,
+        ).astype(np.float32),
     }
 
     metric_values = np.where(labels, 0.12, 0.01).astype(np.float32)
-    metric_values[group_a] += np.float32(0.02)
+    metric_values[group_a] += np.float32(0.06)
     return signal_arrays, metric_values
 
 
@@ -128,6 +143,28 @@ def _build_synthetic_repo(repo_root: Path) -> None:
 
 
 class VerifierTrainingTests(unittest.TestCase):
+    def test_resolve_kill_memo_config_reads_locked_thresholds_from_yaml(self) -> None:
+        config_path = REPO_ROOT / "configs" / "kill_test.yaml"
+        with config_path.open("r", encoding="utf-8") as handle:
+            raw_config = yaml.safe_load(handle)
+
+        resolved = resolve_kill_memo_config(REPO_ROOT, raw_config)
+
+        self.assertEqual(
+            resolved["thresholds"],
+            {
+                "concentration_at_15_min": 0.60,
+                "gini_mean_min": 0.55,
+                "verifier_auprc_min": 0.40,
+                "auprc_multiplier_over_best_heuristic_min": 2.0,
+                "generation_proxy_concentration_at_15_min": 0.50,
+            },
+        )
+        self.assertEqual(
+            resolved["paths"]["error_map_root"],
+            str((REPO_ROOT / "outputs" / "error_maps").resolve()),
+        )
+
     def test_verifier_scripts_write_checkpoints_eval_and_kill_memo(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -216,10 +253,36 @@ class VerifierTrainingTests(unittest.TestCase):
                 memo = json.load(handle)
             self.assertEqual(memo["decision"], "GO")
             self.assertTrue(all(check["passed"] for check in memo["checks"]))
+            self.assertEqual(
+                {check["name"] for check in memo["checks"]},
+                {
+                    "failure_concentration_at_15",
+                    "failure_gini_mean",
+                    "verifier_test_auprc",
+                    "auprc_multiplier_over_best_heuristic",
+                    "generation_proxy_concentration_at_15",
+                },
+            )
+            self.assertEqual(
+                memo["thresholds"],
+                {
+                    "concentration_at_15_min": 0.6,
+                    "gini_mean_min": 0.55,
+                    "verifier_auprc_min": 0.4,
+                    "auprc_multiplier_over_best_heuristic_min": 2.0,
+                    "generation_proxy_concentration_at_15_min": 0.5,
+                },
+            )
+            self.assertGreaterEqual(memo["failure_sparsity"]["mean_concentration_at_15"], 0.60)
+            self.assertGreaterEqual(memo["failure_sparsity"]["mean_gini"], 0.55)
+            self.assertGreaterEqual(memo["measured"]["verifier_test_auprc"], 0.40)
+            self.assertGreaterEqual(memo["measured"]["auprc_multiplier_over_best_heuristic"], 2.0)
+            self.assertGreaterEqual(memo["measured"]["generation_proxy_concentration_at_15"], 0.50)
 
             memo_text = memo_md_path.read_text(encoding="utf-8")
             self.assertIn("Decision: **GO**", memo_text)
             self.assertIn("## Gate Checks", memo_text)
+            self.assertIn("Failure concentration at 15%", memo_text)
 
     def test_eval_script_saves_resolved_config_before_missing_checkpoint_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

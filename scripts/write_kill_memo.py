@@ -15,10 +15,12 @@ if str(SRC_ROOT) not in sys.path:
 from vericodec_diff.config import OmegaConf
 from vericodec_diff.patch_metrics import deep_update
 from vericodec_diff.verifier_training import (
-    SUPPORTED_BUDGET_METRICS,
     resolve_kill_memo_config,
     write_kill_memo,
 )
+
+
+DEFAULT_KILL_TEST_CONFIG_PATH = "configs/kill_test.yaml"
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,8 +29,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default=None,
-        help="Optional repo-relative or absolute YAML config file for kill-memo generation.",
+        default=DEFAULT_KILL_TEST_CONFIG_PATH,
+        help="Repo-relative or absolute YAML config file for kill-memo generation.",
     )
     parser.add_argument(
         "--repo-root",
@@ -46,6 +48,11 @@ def parse_args() -> argparse.Namespace:
         help="Repo-relative or absolute verifier budget-curves CSV path.",
     )
     parser.add_argument(
+        "--error-map-root",
+        default=None,
+        help="Repo-relative or absolute root containing outputs/error_maps/<split>/ files.",
+    )
+    parser.add_argument(
         "--output-dir",
         default=None,
         help="Repo-relative or absolute directory receiving the kill memo and resolved config.",
@@ -61,33 +68,34 @@ def parse_args() -> argparse.Namespace:
         help="Repo-relative or absolute JSON memo output path.",
     )
     parser.add_argument(
-        "--minimum-best-model-auprc",
+        "--concentration-at-15-min",
         type=float,
         default=None,
-        help="Minimum allowed best-model test AUPRC.",
+        help="Minimum allowed mean failure concentration at the top 15%% of patches.",
     )
     parser.add_argument(
-        "--minimum-best-model-auroc",
+        "--gini-mean-min",
         type=float,
         default=None,
-        help="Minimum allowed best-model test AUROC.",
+        help="Minimum allowed mean failure-map Gini coefficient.",
     )
     parser.add_argument(
-        "--minimum-auprc-lift-over-heuristic",
+        "--verifier-auprc-min",
         type=float,
         default=None,
-        help="Minimum allowed AUPRC lift of the best model over the best heuristic baseline.",
+        help="Minimum allowed verifier test AUPRC.",
     )
     parser.add_argument(
-        "--budget-metric-name",
-        choices=SUPPORTED_BUDGET_METRICS,
+        "--auprc-multiplier-over-best-heuristic-min",
+        type=float,
         default=None,
-        help="Budget-curve metric evaluated by the kill gate.",
+        help="Minimum allowed verifier AUPRC multiplier over the best heuristic baseline.",
     )
     parser.add_argument(
-        "--minimum-budget-recovery",
+        "--generation-proxy-concentration-at-15-min",
+        type=float,
         default=None,
-        help="Comma-separated percent:value thresholds, for example 10:0.5,20:0.75.",
+        help="Minimum allowed generation proxy concentration at the 15%% patch budget.",
     )
     return parser.parse_args()
 
@@ -110,6 +118,7 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict[str, object]:
     for arg_name, config_key in (
         ("eval_json", "eval_json"),
         ("budget_curves_csv", "budget_curves_csv"),
+        ("error_map_root", "error_map_root"),
         ("output_dir", "output_dir"),
         ("memo_md_path", "memo_md_path"),
         ("memo_json_path", "memo_json_path"),
@@ -120,11 +129,11 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict[str, object]:
 
     threshold_overrides: dict[str, object] = {}
     for arg_name, config_key in (
-        ("minimum_best_model_auprc", "minimum_best_model_auprc"),
-        ("minimum_best_model_auroc", "minimum_best_model_auroc"),
-        ("minimum_auprc_lift_over_heuristic", "minimum_auprc_lift_over_heuristic"),
-        ("budget_metric_name", "budget_metric_name"),
-        ("minimum_budget_recovery", "minimum_budget_recovery"),
+        ("concentration_at_15_min", "concentration_at_15_min"),
+        ("gini_mean_min", "gini_mean_min"),
+        ("verifier_auprc_min", "verifier_auprc_min"),
+        ("auprc_multiplier_over_best_heuristic_min", "auprc_multiplier_over_best_heuristic_min"),
+        ("generation_proxy_concentration_at_15_min", "generation_proxy_concentration_at_15_min"),
     ):
         value = getattr(args, arg_name)
         if value is not None:
@@ -137,12 +146,10 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict[str, object]:
 
 def main() -> int:
     args = parse_args()
-    raw_config: dict[str, object] = {}
-    if args.config is not None:
-        config_path = Path(args.config).expanduser()
-        if not config_path.is_absolute():
-            config_path = (REPO_ROOT / config_path).resolve()
-        raw_config = _load_yaml_mapping(config_path)
+    config_path = Path(args.config).expanduser()
+    if not config_path.is_absolute():
+        config_path = (REPO_ROOT / config_path).resolve()
+    raw_config = _load_yaml_mapping(config_path)
 
     raw_config = deep_update(raw_config, _build_cli_overrides(args))
     config = resolve_kill_memo_config(REPO_ROOT, raw_config)
@@ -162,8 +169,17 @@ def main() -> int:
     print(f"memo_json={result['memo_json_path']}")
     print(f"decision={payload['decision']}")
     print(f"best_checkpoint={payload['best_model']['checkpoint_filename']}")
-    print(f"best_model_test_auprc={payload['best_model']['test_metrics']['auprc']}")
-    print(f"best_model_test_auroc={payload['best_model']['test_metrics']['auroc']}")
+    print(f"failure_concentration_at_15={payload['measured']['failure_concentration_at_15']}")
+    print(f"failure_gini_mean={payload['measured']['failure_gini_mean']}")
+    print(f"verifier_test_auprc={payload['measured']['verifier_test_auprc']}")
+    print(
+        "auprc_multiplier_over_best_heuristic="
+        f"{payload['measured']['auprc_multiplier_over_best_heuristic']}"
+    )
+    print(
+        "generation_proxy_concentration_at_15="
+        f"{payload['measured']['generation_proxy_concentration_at_15']}"
+    )
     return 0
 
 

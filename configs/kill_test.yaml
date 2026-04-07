@@ -1,6 +1,9 @@
 paths:
   error_map_root: outputs/error_maps
 
+metrics:
+  sparsity_metric_name: patch_error
+
 evaluation:
   budget_percents:
     - 1

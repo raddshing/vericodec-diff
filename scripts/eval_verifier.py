@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--label-metric-name",
         default=None,
-        help="Patch metric name used to derive binary labels.",
+        help="Patch metric name used to derive binary labels, for example lpips or patch_label_top15.",
     )
     parser.add_argument(
         "--label-threshold",

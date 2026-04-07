@@ -17,6 +17,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from vericodec_diff.patch_metrics import SampleRecord, build_patch_error_payload, write_patch_error_npz
+from vericodec_diff.patch_error_targets import augment_patch_error_payload
 from vericodec_diff.sparsity_stats import (
     concentration_at_percent,
     connected_component_summary,
@@ -69,6 +70,7 @@ class SparsityStatsTests(unittest.TestCase):
                 lpips_backend="pixel_l2_debug",
                 wavelet="haar",
             )
+            payload = augment_patch_error_payload(payload)
             write_patch_error_npz(error_map_root / "sample__patch64.npz", payload)
 
             command = [
@@ -80,6 +82,8 @@ class SparsityStatsTests(unittest.TestCase):
                 "outputs/error_maps",
                 "--phase",
                 "smoke_metrics",
+                "--metric-names",
+                "patch_error",
             ]
             subprocess.run(command, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
 
@@ -96,12 +100,13 @@ class SparsityStatsTests(unittest.TestCase):
                 summary = json.load(handle)
             self.assertEqual(summary["sample_count"], 1)
             self.assertEqual(summary["input_file_count"], 1)
-            self.assertEqual(summary["metric_names"], ["lpips", "one_minus_ssim", "hf_wavelet_l1"])
+            self.assertEqual(summary["metric_names"], ["patch_error"])
 
             with records_csv_path.open("r", encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle))
-            self.assertEqual(len(rows), 3)
+            self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["sample_id"], "sample")
+            self.assertEqual(rows[0]["metric"], "patch_error")
 
 
 if __name__ == "__main__":

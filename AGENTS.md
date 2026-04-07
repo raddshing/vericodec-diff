@@ -25,13 +25,16 @@ The locked first-paper claim is: a frozen deeply compressed latent diffusion bac
 - Prefer small importable modules under `src/` and thin entrypoints under `scripts/`.
 - Use argparse + OmegaConf, not Hydra runtime composition.
 - Never hardcode absolute paths except through config defaults.
+- Thresholds for kill gates and experiment gates must live in YAML config, not Python constants.
 - Write JSON/CSV metrics for every experiment.
 - Add at least one smoke test when introducing a new pipeline component.
+- Skills under `.agents/skills/` must preserve valid YAML frontmatter with `name` and `description`.
 
 ## Run discipline
 - Start with the smallest slice that can fail fast.
 - When changing evaluation logic, rerun the corresponding smoke test first.
 - When touching metrics or figure code, do not recompute model outputs unless necessary.
+- Long GPU jobs must be launched by the user outside sandboxed Codex exec; Codex can prepare commands and configs only.
 - Keep notes in `outputs/memos/` for major decisions and deviations.
 
 ## Repo hygiene

@@ -21,12 +21,13 @@ from vericodec_diff.patch_metrics import (
     resolve_path,
     validate_patch_metric_array,
 )
+from vericodec_diff.sparsity_stats import concentration_at_percent, gini_coefficient
 from vericodec_diff.verifier_features import DEFAULT_SIGNAL_NAMES, SIGNAL_SUFFIX
 
 
 VERIFIER_CHECKPOINT_VERSION = 1
 VERIFIER_EVAL_VERSION = 1
-KILL_MEMO_VERSION = 1
+KILL_MEMO_VERSION = 2
 CHECKPOINT_INDEX_FILENAME = "checkpoint_index__patch64.json"
 TRAINING_SUMMARY_FILENAME = "training_summary__patch64.json"
 EVAL_JSON_FILENAME = "verifier_eval__patch64.json"
@@ -40,16 +41,9 @@ DEFAULT_MEMO_MD_PATH = "outputs/memos/kill_test_memo.md"
 DEFAULT_MEMO_JSON_PATH = "outputs/memos/kill_test_memo.json"
 SUPPORTED_MODEL_TYPES = ("logistic", "mlp")
 SUPPORTED_BUDGET_METRICS = ("positive_recall", "metric_mass_recovery")
-LOCKED_KILL_MEMO_THRESHOLDS = {
-    "minimum_best_model_auprc": 0.30,
-    "minimum_best_model_auroc": 0.70,
-    "minimum_auprc_lift_over_heuristic": 0.0,
-    "budget_metric_name": "positive_recall",
-    "minimum_budget_recovery": {
-        10: 0.50,
-        20: 0.75,
-    },
-}
+LOCKED_KILL_GATE_PERCENT = 15
+GENERATION_PROXY_BUDGET_METRIC = "metric_mass_recovery"
+ZERO_DENOMINATOR_RATIO_SENTINEL = 1.0e12
 
 
 class VerifierDatasetError(ValueError):
@@ -177,34 +171,22 @@ def _parse_budget_percents(raw_value: str | Sequence[int] | Sequence[str] | None
     return deduped
 
 
-def _parse_budget_threshold_mapping(raw_value: Any) -> dict[int, float]:
-    if raw_value in (None, "", {}):
-        return {}
-    if isinstance(raw_value, Mapping):
-        items = raw_value.items()
-    elif isinstance(raw_value, str):
-        parsed: dict[str, str] = {}
-        for item in parse_csv_items(raw_value):
-            if ":" not in item:
-                raise ValueError(
-                    "thresholds.minimum_budget_recovery must use percent:value pairs, for example 10:0.5"
-                )
-            budget_text, value_text = item.split(":", 1)
-            parsed[budget_text.strip()] = value_text.strip()
-        items = parsed.items()
-    else:
-        raise ValueError("thresholds.minimum_budget_recovery must be a mapping or percent:value string")
+def _parse_optional_probability_threshold(raw_value: Any, *, name: str) -> float | None:
+    if raw_value in (None, ""):
+        return None
+    value = float(raw_value)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must lie within [0, 1]")
+    return value
 
-    parsed_thresholds: dict[int, float] = {}
-    for budget_raw, value_raw in items:
-        budget_percent = int(budget_raw)
-        minimum_value = float(value_raw)
-        if budget_percent <= 0 or budget_percent > 100:
-            raise ValueError("thresholds.minimum_budget_recovery budget percents must lie within [1, 100]")
-        if minimum_value < 0.0 or minimum_value > 1.0:
-            raise ValueError("thresholds.minimum_budget_recovery values must lie within [0, 1]")
-        parsed_thresholds[budget_percent] = minimum_value
-    return dict(sorted(parsed_thresholds.items()))
+
+def _parse_optional_nonnegative_threshold(raw_value: Any, *, name: str) -> float | None:
+    if raw_value in (None, ""):
+        return None
+    value = float(raw_value)
+    if value < 0.0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
 
 
 def default_verifier_train_config() -> dict[str, Any]:
@@ -278,18 +260,17 @@ def default_kill_memo_config() -> dict[str, Any]:
             "repo_root": ".",
             "eval_json": str(Path(DEFAULT_EVAL_OUTPUT_DIR) / EVAL_JSON_FILENAME),
             "budget_curves_csv": str(Path(DEFAULT_EVAL_OUTPUT_DIR) / BUDGET_CURVES_FILENAME),
+            "error_map_root": DEFAULT_ERROR_MAP_ROOT,
             "output_dir": DEFAULT_MEMO_DIR,
             "memo_md_path": DEFAULT_MEMO_MD_PATH,
             "memo_json_path": DEFAULT_MEMO_JSON_PATH,
         },
         "thresholds": {
-            "minimum_best_model_auprc": LOCKED_KILL_MEMO_THRESHOLDS["minimum_best_model_auprc"],
-            "minimum_best_model_auroc": LOCKED_KILL_MEMO_THRESHOLDS["minimum_best_model_auroc"],
-            "minimum_auprc_lift_over_heuristic": LOCKED_KILL_MEMO_THRESHOLDS[
-                "minimum_auprc_lift_over_heuristic"
-            ],
-            "budget_metric_name": LOCKED_KILL_MEMO_THRESHOLDS["budget_metric_name"],
-            "minimum_budget_recovery": dict(LOCKED_KILL_MEMO_THRESHOLDS["minimum_budget_recovery"]),
+            "concentration_at_15_min": None,
+            "gini_mean_min": None,
+            "verifier_auprc_min": None,
+            "auprc_multiplier_over_best_heuristic_min": None,
+            "generation_proxy_concentration_at_15_min": None,
         },
     }
 
@@ -492,6 +473,11 @@ def resolve_kill_memo_config(repo_root: Path, raw_config: Mapping[str, Any]) -> 
         str(paths.get("budget_curves_csv", str(Path(DEFAULT_EVAL_OUTPUT_DIR) / BUDGET_CURVES_FILENAME))),
         name="paths.budget_curves_csv",
     )
+    error_map_root = _validate_repo_relative_path(
+        resolved_repo_root,
+        str(paths.get("error_map_root", DEFAULT_ERROR_MAP_ROOT)),
+        name="paths.error_map_root",
+    )
     output_dir = _validate_repo_relative_path(
         resolved_repo_root,
         str(paths.get("output_dir", DEFAULT_MEMO_DIR)),
@@ -508,37 +494,37 @@ def resolve_kill_memo_config(repo_root: Path, raw_config: Mapping[str, Any]) -> 
         name="paths.memo_json_path",
     )
 
-    budget_metric_name = str(thresholds.get("budget_metric_name", "positive_recall")).strip()
-    if budget_metric_name not in SUPPORTED_BUDGET_METRICS:
-        raise ValueError(f"thresholds.budget_metric_name must be one of {SUPPORTED_BUDGET_METRICS}")
-
     return {
         "paths": {
             "repo_root": str(resolved_repo_root),
             "eval_json": str(eval_json),
             "budget_curves_csv": str(budget_curves_csv),
+            "error_map_root": str(error_map_root),
             "output_dir": str(output_dir),
             "memo_md_path": str(memo_md_path),
             "memo_json_path": str(memo_json_path),
         },
         "thresholds": {
-            "minimum_best_model_auprc": (
-                None
-                if thresholds.get("minimum_best_model_auprc") in (None, "")
-                else float(thresholds.get("minimum_best_model_auprc"))
+            "concentration_at_15_min": _parse_optional_probability_threshold(
+                thresholds.get("concentration_at_15_min"),
+                name="thresholds.concentration_at_15_min",
             ),
-            "minimum_best_model_auroc": (
-                None
-                if thresholds.get("minimum_best_model_auroc") in (None, "")
-                else float(thresholds.get("minimum_best_model_auroc"))
+            "gini_mean_min": _parse_optional_probability_threshold(
+                thresholds.get("gini_mean_min"),
+                name="thresholds.gini_mean_min",
             ),
-            "minimum_auprc_lift_over_heuristic": (
-                None
-                if thresholds.get("minimum_auprc_lift_over_heuristic") in (None, "")
-                else float(thresholds.get("minimum_auprc_lift_over_heuristic"))
+            "verifier_auprc_min": _parse_optional_probability_threshold(
+                thresholds.get("verifier_auprc_min"),
+                name="thresholds.verifier_auprc_min",
             ),
-            "budget_metric_name": budget_metric_name,
-            "minimum_budget_recovery": _parse_budget_threshold_mapping(thresholds.get("minimum_budget_recovery")),
+            "auprc_multiplier_over_best_heuristic_min": _parse_optional_nonnegative_threshold(
+                thresholds.get("auprc_multiplier_over_best_heuristic_min"),
+                name="thresholds.auprc_multiplier_over_best_heuristic_min",
+            ),
+            "generation_proxy_concentration_at_15_min": _parse_optional_probability_threshold(
+                thresholds.get("generation_proxy_concentration_at_15_min"),
+                name="thresholds.generation_proxy_concentration_at_15_min",
+            ),
         },
     }
 
@@ -1522,10 +1508,58 @@ def _render_bool(value: bool) -> str:
     return "PASS" if value else "FAIL"
 
 
+def _ratio_with_zero_guard(numerator: float, denominator: float) -> float:
+    if denominator > 0.0:
+        return float(numerator / denominator)
+    if numerator <= 0.0:
+        return 0.0
+    return ZERO_DENOMINATOR_RATIO_SENTINEL
+
+
+def _compute_failure_sparsity_summary(
+    *,
+    error_map_root: Path,
+    selected_splits: Sequence[str],
+    metric_name: str,
+) -> dict[str, Any]:
+    error_map = _discover_artifact_map(
+        error_map_root,
+        suffix=PATCH_ERROR_SUFFIX,
+        selected_splits=selected_splits,
+        artifact_label="patch-error",
+    )
+    concentration_values: list[float] = []
+    gini_values: list[float] = []
+    for split, sample_id in sorted(error_map):
+        sample_path = error_map[(split, sample_id)]
+        loaded_sample_id, loaded_split, metric_values = _load_label_metric_values(
+            sample_path,
+            metric_name=metric_name,
+        )
+        if loaded_sample_id != sample_id or loaded_split != split:
+            raise VerifierTrainingError(f"Patch-error payload mismatch for {sample_path}")
+        concentration_values.append(concentration_at_percent(metric_values, LOCKED_KILL_GATE_PERCENT))
+        gini_values.append(gini_coefficient(metric_values))
+
+    if not concentration_values:
+        raise VerifierTrainingError(
+            f"No patch-error artifacts were available to compute kill-gate sparsity for splits {list(selected_splits)}"
+        )
+
+    return {
+        "metric_name": metric_name,
+        "test_splits": [str(split) for split in selected_splits],
+        "sample_count": int(len(concentration_values)),
+        "mean_concentration_at_15": _round_float(float(np.mean(concentration_values, dtype=np.float64))),
+        "mean_gini": _round_float(float(np.mean(gini_values, dtype=np.float64))),
+    }
+
+
 def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
     repo_root = Path(config["paths"]["repo_root"])
     eval_json_path = Path(config["paths"]["eval_json"])
     budget_curves_csv_path = Path(config["paths"]["budget_curves_csv"])
+    error_map_root = Path(config["paths"]["error_map_root"])
     memo_md_path = Path(config["paths"]["memo_md_path"])
     memo_json_path = Path(config["paths"]["memo_json_path"])
 
@@ -1549,15 +1583,45 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
 
     best_model_metrics = dict(evaluation["best_model"]["test_metrics"])
     heuristic_metrics = dict(evaluation["heuristic_baseline"]["test_metrics"])
+    label_definition = dict(evaluation["label_definition"])
+    test_dataset_summary = dict(evaluation["datasets"]["test"])
+    test_splits = [str(split) for split in test_dataset_summary.get("raw_splits", [])]
+    if not test_splits:
+        raise VerifierTrainingError("Evaluation JSON is missing datasets.test.raw_splits required for the kill memo")
 
-    minimum_best_model_auprc = thresholds.get("minimum_best_model_auprc")
-    if minimum_best_model_auprc is not None:
+    failure_sparsity = _compute_failure_sparsity_summary(
+        error_map_root=error_map_root,
+        selected_splits=test_splits,
+        metric_name=str(label_definition["metric_name"]),
+    )
+    best_model_auprc = float(best_model_metrics["auprc"])
+    heuristic_auprc = float(heuristic_metrics["auprc"])
+    auprc_multiplier = _ratio_with_zero_guard(best_model_auprc, heuristic_auprc)
+    generation_proxy_row = _find_budget_row(
+        budget_rows,
+        curve_role="best_model",
+        budget_percent=LOCKED_KILL_GATE_PERCENT,
+    )
+    generation_proxy_concentration_at_15 = float(generation_proxy_row[GENERATION_PROXY_BUDGET_METRIC])
+    measured_metrics = {
+        "failure_concentration_at_15": failure_sparsity["mean_concentration_at_15"],
+        "failure_gini_mean": failure_sparsity["mean_gini"],
+        "verifier_test_auprc": _round_float(best_model_auprc),
+        "verifier_test_auroc": _round_float(float(best_model_metrics["auroc"])),
+        "heuristic_test_auprc": _round_float(heuristic_auprc),
+        "heuristic_test_auroc": _round_float(float(heuristic_metrics["auroc"])),
+        "auprc_multiplier_over_best_heuristic": _round_float(auprc_multiplier),
+        "generation_proxy_concentration_at_15": _round_float(generation_proxy_concentration_at_15),
+    }
+
+    concentration_at_15_min = thresholds.get("concentration_at_15_min")
+    if concentration_at_15_min is not None:
         configured_gate_count += 1
-        measured = float(best_model_metrics["auprc"])
-        threshold = float(minimum_best_model_auprc)
+        measured = float(measured_metrics["failure_concentration_at_15"])
+        threshold = float(concentration_at_15_min)
         checks.append(
             {
-                "name": "best_model_test_auprc",
+                "name": "failure_concentration_at_15",
                 "measured": _round_float(measured),
                 "threshold": _round_float(threshold),
                 "comparison": ">=",
@@ -1565,14 +1629,14 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
             }
         )
 
-    minimum_best_model_auroc = thresholds.get("minimum_best_model_auroc")
-    if minimum_best_model_auroc is not None:
+    gini_mean_min = thresholds.get("gini_mean_min")
+    if gini_mean_min is not None:
         configured_gate_count += 1
-        measured = float(best_model_metrics["auroc"])
-        threshold = float(minimum_best_model_auroc)
+        measured = float(measured_metrics["failure_gini_mean"])
+        threshold = float(gini_mean_min)
         checks.append(
             {
-                "name": "best_model_test_auroc",
+                "name": "failure_gini_mean",
                 "measured": _round_float(measured),
                 "threshold": _round_float(threshold),
                 "comparison": ">=",
@@ -1580,14 +1644,14 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
             }
         )
 
-    minimum_lift = thresholds.get("minimum_auprc_lift_over_heuristic")
-    if minimum_lift is not None:
+    verifier_auprc_min = thresholds.get("verifier_auprc_min")
+    if verifier_auprc_min is not None:
         configured_gate_count += 1
-        measured = float(best_model_metrics["auprc"]) - float(heuristic_metrics["auprc"])
-        threshold = float(minimum_lift)
+        measured = float(measured_metrics["verifier_test_auprc"])
+        threshold = float(verifier_auprc_min)
         checks.append(
             {
-                "name": "best_model_test_auprc_lift_over_heuristic",
+                "name": "verifier_test_auprc",
                 "measured": _round_float(measured),
                 "threshold": _round_float(threshold),
                 "comparison": ">=",
@@ -1595,16 +1659,29 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
             }
         )
 
-    budget_metric_name = str(thresholds["budget_metric_name"])
-    budget_thresholds = dict(thresholds["minimum_budget_recovery"])
-    for budget_percent, minimum_value in sorted(budget_thresholds.items()):
+    auprc_multiplier_min = thresholds.get("auprc_multiplier_over_best_heuristic_min")
+    if auprc_multiplier_min is not None:
         configured_gate_count += 1
-        row = _find_budget_row(budget_rows, curve_role="best_model", budget_percent=int(budget_percent))
-        measured = float(row[budget_metric_name])
-        threshold = float(minimum_value)
+        measured = float(measured_metrics["auprc_multiplier_over_best_heuristic"])
+        threshold = float(auprc_multiplier_min)
         checks.append(
             {
-                "name": f"best_model_{budget_metric_name}_at_{int(budget_percent)}pct_budget",
+                "name": "auprc_multiplier_over_best_heuristic",
+                "measured": _round_float(measured),
+                "threshold": _round_float(threshold),
+                "comparison": ">=",
+                "passed": measured >= threshold,
+            }
+        )
+
+    generation_proxy_min = thresholds.get("generation_proxy_concentration_at_15_min")
+    if generation_proxy_min is not None:
+        configured_gate_count += 1
+        measured = float(measured_metrics["generation_proxy_concentration_at_15"])
+        threshold = float(generation_proxy_min)
+        checks.append(
+            {
+                "name": "generation_proxy_concentration_at_15",
                 "measured": _round_float(measured),
                 "threshold": _round_float(threshold),
                 "comparison": ">=",
@@ -1614,7 +1691,7 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
 
     if configured_gate_count == 0:
         raise VerifierTrainingError(
-            "Kill memo thresholds are not configured. Provide at least one threshold in write_kill_memo.py"
+            "Kill memo thresholds are not configured. Provide them in configs/kill_test.yaml or via CLI overrides."
         )
 
     decision = "GO" if all(bool(check["passed"]) for check in checks) else "NO_GO"
@@ -1632,18 +1709,26 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
             "direction_name": evaluation["heuristic_baseline"]["direction_name"],
             "test_metrics": heuristic_metrics,
         },
-        "label_definition": evaluation["label_definition"],
+        "label_definition": label_definition,
+        "failure_sparsity": failure_sparsity,
+        "generation_proxy": {
+            "budget_percent": LOCKED_KILL_GATE_PERCENT,
+            "metric_name": GENERATION_PROXY_BUDGET_METRIC,
+            "measured_concentration_at_15": measured_metrics["generation_proxy_concentration_at_15"],
+        },
+        "measured": measured_metrics,
         "thresholds": {
-            "minimum_best_model_auprc": minimum_best_model_auprc,
-            "minimum_best_model_auroc": minimum_best_model_auroc,
-            "minimum_auprc_lift_over_heuristic": minimum_lift,
-            "budget_metric_name": budget_metric_name,
-            "minimum_budget_recovery": budget_thresholds,
+            "concentration_at_15_min": concentration_at_15_min,
+            "gini_mean_min": gini_mean_min,
+            "verifier_auprc_min": verifier_auprc_min,
+            "auprc_multiplier_over_best_heuristic_min": auprc_multiplier_min,
+            "generation_proxy_concentration_at_15_min": generation_proxy_min,
         },
         "checks": checks,
         "artifacts": {
             "eval_json": display_path(eval_json_path, repo_root),
             "budget_curves_csv": display_path(budget_curves_csv_path, repo_root),
+            "error_map_root": display_path(error_map_root, repo_root),
         },
     }
 
@@ -1657,10 +1742,17 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
         "",
         "## Measured Metrics",
         "",
-        f"- Best model test AUPRC: `{best_model_metrics['auprc']}`",
-        f"- Best model test AUROC: `{best_model_metrics['auroc']}`",
-        f"- Heuristic test AUPRC: `{heuristic_metrics['auprc']}`",
-        f"- Heuristic test AUROC: `{heuristic_metrics['auroc']}`",
+        f"- Failure concentration at 15%: `{measured_metrics['failure_concentration_at_15']}`",
+        f"- Failure Gini mean: `{measured_metrics['failure_gini_mean']}`",
+        f"- Verifier test AUPRC: `{measured_metrics['verifier_test_auprc']}`",
+        f"- Verifier test AUROC: `{measured_metrics['verifier_test_auroc']}`",
+        f"- Best heuristic test AUPRC: `{measured_metrics['heuristic_test_auprc']}`",
+        f"- Best heuristic test AUROC: `{measured_metrics['heuristic_test_auroc']}`",
+        f"- AUPRC multiplier over best heuristic: `{measured_metrics['auprc_multiplier_over_best_heuristic']}`",
+        (
+            f"- Generation-proxy concentration at 15%: `{measured_metrics['generation_proxy_concentration_at_15']}` "
+            f"(`{GENERATION_PROXY_BUDGET_METRIC}` at 15% patch budget)"
+        ),
         "",
         "## Gate Checks",
         "",
@@ -1678,6 +1770,7 @@ def write_kill_memo(config: Mapping[str, Any]) -> dict[str, Any]:
             "",
             f"- Evaluation JSON: `{display_path(eval_json_path, repo_root)}`",
             f"- Budget curves CSV: `{display_path(budget_curves_csv_path, repo_root)}`",
+            f"- Patch-error root: `{display_path(error_map_root, repo_root)}`",
         ]
     )
 

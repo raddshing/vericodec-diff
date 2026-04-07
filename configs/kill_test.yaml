@@ -1,0 +1,18 @@
+paths:
+  error_map_root: outputs/error_maps
+
+evaluation:
+  budget_percents:
+    - 1
+    - 2
+    - 5
+    - 10
+    - 15
+    - 20
+
+thresholds:
+  concentration_at_15_min: 0.60
+  gini_mean_min: 0.55
+  verifier_auprc_min: 0.40
+  auprc_multiplier_over_best_heuristic_min: 2.0
+  generation_proxy_concentration_at_15_min: 0.50

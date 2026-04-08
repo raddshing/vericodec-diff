@@ -1,0 +1,35 @@
+paths:
+  repo_root: .
+  output_root: outputs/rd_lora/probe
+  accelerate_config: configs/accelerate/single_gpu_fp16.yaml
+
+run:
+  name: week2_probe
+  seed: 20260409
+
+preflight:
+  require_torch_cuda: true
+  required_diffusers_version: 0.38.0.dev0
+  required_accelerate_config: configs/accelerate/single_gpu_fp16.yaml
+
+schema:
+  layer_group_count: 6
+  timestep_band_count: 4
+  num_inference_steps: 20
+  candidate_ranks:
+    - 0
+    - 2
+    - 4
+    - 8
+    - 16
+  timesteps: null
+  layer_catalog: []
+
+features:
+  include_attention_output_drift: true
+
+backend:
+  kind: mock
+  mock:
+    sample_count: 2
+    vector_size: 8

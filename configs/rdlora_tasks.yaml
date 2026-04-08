@@ -9,9 +9,38 @@ defaults:
 tasks:
   smoke_portrait:
     concept_name: fixture_smoke_portrait
+    task_type: subject_personalization
     validation_prompt: A clean studio portrait of the same person, soft window light, shallow depth of field.
     train_records:
       - image: tests/fixtures/rdlora_pilot/portrait_001.ppm
         caption: A head-and-shoulders portrait of a person looking at the camera, soft studio light.
       - image: tests/fixtures/rdlora_pilot/portrait_002.ppm
         caption: A close-up portrait of the same person with neutral expression, natural light.
+  t_lora_dog_subject:
+    concept_name: corgi_subject
+    task_type: subject_personalization
+    validation_prompt: A studio portrait photo of the same corgi dog on a seamless backdrop, sharp focus.
+    train_records:
+      - image: baselines/external/controlgenai_t-lora/dog_example/00.jpg
+        caption: A corgi puppy sitting on an orange seamless backdrop in a studio.
+      - image: baselines/external/controlgenai_t-lora/dog_example/01.jpg
+        caption: A playful corgi puppy in a bright studio portrait.
+      - image: baselines/external/controlgenai_t-lora/dog_example/02.jpg
+        caption: A close studio photo of the same corgi puppy on a vivid backdrop.
+      - image: baselines/external/controlgenai_t-lora/dog_example/03.jpg
+        caption: A corgi puppy posed for a clean studio portrait.
+      - image: baselines/external/controlgenai_t-lora/dog_example/04.jpg
+        caption: The same corgi puppy photographed in a colorful studio setup.
+  synthetic_signage_domain:
+    concept_name: synthetic_signage_domain
+    task_type: style_domain_adaptation
+    validation_prompt: A clean synthetic signage poster with stacked warning placards, bold sans-serif typography, and flat vector styling.
+    train_records:
+      - image: data/raw/synthetic/text-posters-signs/synthetic_kill_text_posters_signs_001.png
+        caption: A synthetic signage collage with bold block text, warning labels, and flat vector shapes.
+      - image: data/raw/synthetic/text-posters-signs/synthetic_kill_text_posters_signs_002.png
+        caption: A stylized poster made of overlapping sign panels, large typography, and clean vector graphics.
+      - image: data/raw/synthetic/text-posters-signs/synthetic_kill_text_posters_signs_003.png
+        caption: A synthetic text-heavy signboard composition with stacked placards and flat design.
+      - image: data/raw/synthetic/text-posters-signs/synthetic_kill_text_posters_signs_004.png
+        caption: A vector-style signage poster with prominent words, label tags, and simple geometric layout.

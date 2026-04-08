@@ -1,0 +1,61 @@
+paths:
+  repo_root: .
+  tasks_config: configs/rdlora_tasks.yaml
+  probe_run_dir: outputs/rd_lora/probe/week2_probe
+  allocator_run_dir: outputs/rd_lora/allocator/week2_allocator
+  vanilla_config: configs/rdlora_vanilla.yaml
+  tlora_config: configs/tlora_baseline.yaml
+  output_root: outputs/rd_lora/stage_d
+  memo_output_dir: outputs/memos
+  accelerate_config: configs/accelerate/single_gpu_fp16.yaml
+
+run:
+  name: week2_gate
+  seed: 20260409
+
+preflight:
+  require_torch_cuda: true
+  required_diffusers_version: 0.38.0.dev0
+  required_accelerate_config: configs/accelerate/single_gpu_fp16.yaml
+  required_gpu_index: 0
+  required_gpu_name_substring: RTX 3090
+  required_gpu_memory_gib_min: 24
+
+pilot:
+  task_ids:
+    - t_lora_dog_subject
+    - synthetic_signage_domain
+
+methods:
+  enabled:
+    - uniform
+    - layer_only
+    - timestep_only
+    - proposed
+    - t_lora
+
+allocation:
+  budget: 96
+  utility_field: utility_score
+  prediction_field: predicted_utility
+  top_mass_fraction: 0.20
+  holdout_fraction: 0.25
+  top_k_cells: 5
+
+training:
+  execute: false
+  gradient_checkpointing: true
+  mixed_precision: fp16
+  allow_missing_backends: true
+
+evaluation:
+  locked_metric_name: measured_utility_mass
+  locked_metric_kind: allocation_proxy
+
+gate:
+  thresholds:
+    top_20_mass_min: 0.60
+    held_out_spearman_min: 0.50
+    top_5_precision_min: 0.60
+    proposed_relative_gain_min: 0.10
+    overhead_ratio_max: 1.5

@@ -1,0 +1,44 @@
+paths:
+  repo_root: .
+  registry_lock: baselines/registry.lock.json
+  baseline_status_doc: docs/RDLORA_BASELINE_STATUS.md
+  external_root: baselines/external
+
+substrate:
+  required_family: sdxl
+  base_model_repo: stabilityai/stable-diffusion-xl-base-1.0
+  default_resolution: 1024
+  forbid_substrate_switch_from_sdxl: true
+
+checks:
+  require_verified_official_repo: true
+  require_local_checkout_for_registered_baselines: true
+  require_origin_remote_match: true
+  require_pinned_commit: true
+  allow_appendix_substrate_mismatch: true
+
+baselines:
+  critical_path_ids:
+    - diffusers_sdxl_lora
+    - t_lora
+  appendix_only_ids:
+    - int_lora
+    - mpq_dm
+  docs_only_ids:
+    - tsm
+    - aira
+    - accuquant
+
+summary:
+  columns:
+    - name
+    - official_repo
+    - local_path
+    - status
+    - critical_path
+    - notes
+
+policies:
+  block_on_unverified_critical_repo: true
+  block_on_missing_registered_checkout: true
+  block_on_critical_substrate_switch: true

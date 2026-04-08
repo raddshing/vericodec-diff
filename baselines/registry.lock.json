@@ -79,6 +79,30 @@
       "proxy_checkout_path": null
     },
     {
+      "id": "diffusers_sdxl_lora",
+      "name": "diffusers SDXL LoRA",
+      "upstream_url": "https://github.com/huggingface/diffusers.git",
+      "default_branch": "main",
+      "pinned_commit": "431066e96762442aad5b675893a91bb8c5bfb3b9",
+      "local_checkout_path": "baselines/external/huggingface_diffusers",
+      "status": "available",
+      "expected_weights": [
+        "stabilityai/stable-diffusion-xl-base-1.0"
+      ],
+      "entrypoints": [
+        "examples/text_to_image/train_text_to_image_lora_sdxl.py",
+        "examples/dreambooth/train_dreambooth_lora_sdxl.py"
+      ],
+      "environment_notes": [
+        "Official example requirements include accelerate>=0.16.0, torchvision, transformers>=4.25.1, ftfy, tensorboard, Jinja2, and peft; the text-to-image example also requires datasets>=2.19.1.",
+        "Both pinned SDXL LoRA scripts in the official checkout enforce check_min_version(\"0.38.0.dev0\"), so exact upstream reproduction should use the local diffusers checkout rather than only the PyPI diffusers pin from the T-LoRA environment.",
+        "The repo-local environment/rdlora-env.yaml is SDXL-first and tracks the T-LoRA-compatible base stack; upgrade peft and reinstall the local diffusers checkout in a disposable overlay when exercising the current text-to-image example on main."
+      ],
+      "reason": null,
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    },
+    {
       "id": "ect",
       "name": "ECT",
       "upstream_url": "https://github.com/locuslab/ect.git",
@@ -160,6 +184,59 @@
       "proxy_checkout_path": null
     },
     {
+      "id": "int_lora",
+      "name": "IntLoRA",
+      "upstream_url": "https://github.com/csguoh/IntLoRA.git",
+      "default_branch": "main",
+      "pinned_commit": "65a8257a4311e0feab9b33477c9748d13d8ce17b",
+      "local_checkout_path": "baselines/external/csguoh_intlora",
+      "status": "available",
+      "expected_weights": [
+        "Stable Diffusion 1.5 pretrained weights",
+        "DreamBooth subject-driven generation dataset"
+      ],
+      "entrypoints": [
+        "train_dreambooth_quant.py",
+        "train_dreambooth_quant.sh",
+        "evaluation.py",
+        "get_results.py"
+      ],
+      "environment_notes": [
+        "Upstream ships environment.yaml for Python 3.9.18, CUDA 11.8, PyTorch 2.1.0, diffusers 0.26.0, accelerate 0.25.0, and peft 0.7.1.",
+        "The official README targets quantized DreamBooth fine-tuning and evaluation on Stable Diffusion 1.5 rather than SDXL.",
+        "Keep IntLoRA in its own appendix environment instead of folding its older CUDA and Stable Diffusion 1.5 stack into the SDXL-first RD-LoRA environment."
+      ],
+      "reason": "Official repo and environment are verified, but the runnable substrate is quantized DreamBooth on Stable Diffusion 1.5 rather than the SDXL substrate required on the RD-LoRA critical path.",
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    },
+    {
+      "id": "mpq_dm",
+      "name": "MPQ-DM",
+      "upstream_url": "https://github.com/wlfeng0509/MPQ-DM.git",
+      "default_branch": "main",
+      "pinned_commit": "2b05dd79c565969d0144a71b782873a7f7060345",
+      "local_checkout_path": "baselines/external/wlfeng0509_mpq-dm",
+      "status": "partial",
+      "expected_weights": [
+        "LDM cin256-v2 checkpoint from https://ommer-lab.com/files/latent-diffusion/nitro/cin/model.ckpt"
+      ],
+      "entrypoints": [
+        "quant_scripts/collect_input_4_calib.py",
+        "quant_scripts/quantize_ldm_naive.py",
+        "quant_scripts/train_ourdm.py",
+        "quant_scripts/sample_lora_model.py"
+      ],
+      "environment_notes": [
+        "The official README delegates setup to the latent-diffusion environment instead of shipping a dedicated environment file.",
+        "The official calibration path requires a manual modification to ldm/models/diffusion/ddpm.py before quant_scripts/collect_input_4_calib.py is run.",
+        "The official substrate is LDM cin256-v2 quantization rather than SDXL, so this baseline stays appendix-only even after checkout verification."
+      ],
+      "reason": "Not on the critical reproduction path because MPQ-DM targets low-bit latent-diffusion quantization and still requires a manual upstream code edit before its official calibration flow is runnable.",
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    },
+    {
       "id": "ras",
       "name": "RAS",
       "upstream_url": "https://github.com/microsoft/RAS.git",
@@ -202,6 +279,30 @@
       "environment_notes": [
         "Upstream quick start uses ./environment_setup.sh sana.",
         "Repo-local environment/sana-env.yaml already includes diffusers support for SanaPipeline."
+      ],
+      "reason": null,
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    },
+    {
+      "id": "t_lora",
+      "name": "T-LoRA",
+      "upstream_url": "https://github.com/ControlGenAI/T-LoRA.git",
+      "default_branch": "main",
+      "pinned_commit": "12f36f361bbb6e32e3bb3efc95bdf60db9b14fdd",
+      "local_checkout_path": "baselines/external/controlgenai_t-lora",
+      "status": "available",
+      "expected_weights": [
+        "stabilityai/stable-diffusion-xl-base-1.0"
+      ],
+      "entrypoints": [
+        "train.py",
+        "inference.py"
+      ],
+      "environment_notes": [
+        "Upstream ships tlora_env.yml with Python 3.11.11, diffusers 0.25.1, accelerate 0.26.1, torch 2.6.0, torchvision 0.21.0, transformers 4.37.1, and peft 0.7.0.",
+        "The official SDXL README uses stabilityai/stable-diffusion-xl-base-1.0, --resolution=1024, and single-image customization on a single H100.",
+        "The official repo also ships a separate FLUX path under flux/, but RD-LoRA keeps only the SDXL path on the critical substrate."
       ],
       "reason": null,
       "proxy_baseline_id": null,

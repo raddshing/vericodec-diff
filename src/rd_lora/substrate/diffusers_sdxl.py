@@ -236,6 +236,7 @@ def default_vanilla_lora_config() -> dict[str, Any]:
             "max_train_steps": 1,
             "checkpointing_steps": 1,
             "checkpoints_total_limit": 1,
+            "gradient_checkpointing": False,
             "mixed_precision": "no",
             "num_validation_images": 1,
             "dataloader_num_workers": 0,
@@ -394,6 +395,8 @@ def resolve_vanilla_lora_config(repo_root: Path, raw_config: Mapping[str, Any]) 
     resolved_launch_config = None
     if launch_config_file not in (None, ""):
         resolved_launch_config = resolve_path(resolved_repo_root, str(launch_config_file)).resolve()
+        if not resolved_launch_config.is_file():
+            raise FileNotFoundError(f"accelerate launch config not found: {resolved_launch_config}")
     num_processes = _parse_positive_int(
         launch.get("num_processes", 1),
         name="accelerate.launch.num_processes",
@@ -429,6 +432,15 @@ def resolve_vanilla_lora_config(repo_root: Path, raw_config: Mapping[str, Any]) 
         smoke_validation_prompt = None
 
     training = _resolve_training_config(dict(config.get("training", {})))
+
+    resolved_smoke = {
+        "task_id": smoke_task_id,
+        "run_name": smoke_run_name,
+        "validation_prompt": smoke_validation_prompt,
+    }
+    for key in training.keys():
+        if key in smoke:
+            resolved_smoke[key] = smoke.get(key)
 
     return {
         "paths": {
@@ -466,20 +478,7 @@ def resolve_vanilla_lora_config(repo_root: Path, raw_config: Mapping[str, Any]) 
             "validation_prompt": run_validation_prompt,
         },
         "training": training,
-        "smoke": {
-            "task_id": smoke_task_id,
-            "run_name": smoke_run_name,
-            "validation_prompt": smoke_validation_prompt,
-            "train_batch_size": smoke.get("train_batch_size"),
-            "gradient_accumulation_steps": smoke.get("gradient_accumulation_steps"),
-            "max_train_steps": smoke.get("max_train_steps"),
-            "checkpointing_steps": smoke.get("checkpointing_steps"),
-            "checkpoints_total_limit": smoke.get("checkpoints_total_limit"),
-            "mixed_precision": smoke.get("mixed_precision"),
-            "num_validation_images": smoke.get("num_validation_images"),
-            "dataloader_num_workers": smoke.get("dataloader_num_workers"),
-            "report_to": smoke.get("report_to"),
-        },
+        "smoke": resolved_smoke,
     }
 
 

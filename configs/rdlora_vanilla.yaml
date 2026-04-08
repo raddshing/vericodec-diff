@@ -10,7 +10,7 @@ paths:
 accelerate:
   executable: accelerate
   launch:
-    config_file: null
+    config_file: configs/accelerate/single_gpu_fp16.yaml
     num_processes: 1
 
 model:
@@ -63,7 +63,8 @@ smoke:
   max_train_steps: 1
   checkpointing_steps: 1
   checkpoints_total_limit: 1
-  mixed_precision: "no"
+  gradient_checkpointing: true
+  mixed_precision: fp16
   num_validation_images: 1
   dataloader_num_workers: 0
   report_to: tensorboard

@@ -44,6 +44,29 @@ def _write_config_pair(repo_root: Path) -> tuple[Path, Path]:
     source_root = repo_root / "pilot_sources"
     _write_source_image(source_root / "portrait_a.png", size=(1600, 1200), color=(220, 180, 150))
     _write_source_image(source_root / "portrait_b.png", size=(900, 1500), color=(120, 150, 210))
+    accelerate_config_path = repo_root / "configs" / "accelerate" / "single_gpu_fp16.yaml"
+    accelerate_config_path.parent.mkdir(parents=True, exist_ok=True)
+    accelerate_config_path.write_text(
+        "\n".join(
+            [
+                "compute_environment: LOCAL_MACHINE",
+                "debug: false",
+                "distributed_type: 'NO'",
+                "enable_cpu_affinity: false",
+                "gpu_ids: '0'",
+                "machine_rank: 0",
+                "main_training_function: main",
+                "mixed_precision: fp16",
+                "num_machines: 1",
+                "num_processes: 1",
+                "rdzv_backend: static",
+                "same_network: true",
+                "use_cpu: false",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     tasks_config = {
         "version": 1,
@@ -77,6 +100,7 @@ def _write_config_pair(repo_root: Path) -> tuple[Path, Path]:
     raw_config = default_vanilla_lora_config()
     raw_config["paths"]["repo_root"] = str(repo_root)
     raw_config["paths"]["tasks_config"] = str(tasks_path)
+    raw_config["accelerate"]["launch"]["config_file"] = str(accelerate_config_path.relative_to(repo_root))
     raw_config["paths"]["official_script"] = str(
         REPO_ROOT
         / "baselines"
@@ -86,6 +110,8 @@ def _write_config_pair(repo_root: Path) -> tuple[Path, Path]:
         / "text_to_image"
         / "train_text_to_image_lora_sdxl.py"
     )
+    raw_config["smoke"]["gradient_checkpointing"] = True
+    raw_config["smoke"]["mixed_precision"] = "fp16"
     config_path = repo_root / "rdlora_vanilla_test.yaml"
     with config_path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(raw_config, handle, sort_keys=False)
@@ -176,6 +202,7 @@ class DiffusersSdxlHarnessTests(unittest.TestCase):
                 "baselines/external/huggingface_diffusers/examples/text_to_image/train_text_to_image_lora_sdxl.py",
                 plan["manual_command"],
             )
+            self.assertIn("--config_file", plan["command"])
             self.assertIn("--train_data_dir", plan["command"])
             self.assertIn("--pretrained_model_name_or_path", plan["command"])
             self.assertIn("--resolution", plan["command"])
@@ -209,10 +236,18 @@ class DiffusersSdxlHarnessTests(unittest.TestCase):
             self.assertIn("manual_gpu_command=", completed.stdout)
             self.assertIn("wrapped_official_script=1", completed.stdout)
 
-    def test_smoke_script_is_cpu_only_command_construction_check(self) -> None:
+    def test_smoke_command_uses_smoke_overrides_and_writes_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             config_path, _ = _write_config_pair(repo_root)
+
+            config = resolve_vanilla_lora_config(REPO_ROOT, yaml.safe_load(config_path.read_text()))
+            tasks_bundle = load_rdlora_tasks(config["paths"]["tasks_config"])
+            prepare_pilot_imagefolder(config, tasks_bundle, "smoke_portrait")
+            plan = build_diffusers_sdxl_lora_command(config, task_id="smoke_portrait", smoke=True)
+            self.assertIn("--config_file", plan["command"])
+            self.assertIn("--gradient_checkpointing", plan["command"])
+            self.assertIn("fp16", plan["command"])
 
             completed = subprocess.run(
                 [sys.executable, str(SMOKE_SCRIPT), "--config", str(config_path), "--task-id", "smoke_portrait"],
@@ -226,6 +261,9 @@ class DiffusersSdxlHarnessTests(unittest.TestCase):
             self.assertTrue((output_dir / "resolved_config.yaml").is_file())
             self.assertTrue((output_dir / "smoke_summary.json").is_file())
             self.assertTrue((output_dir / "manual_gpu_command.sh").is_file())
+            shell_command = (output_dir / "manual_gpu_command.sh").read_text(encoding="utf-8")
+            self.assertIn("--config_file", shell_command)
+            self.assertIn("--gradient_checkpointing", shell_command)
             self.assertIn("manual_gpu_command=", completed.stdout)
             self.assertIn("wrapped_official_script=1", completed.stdout)
 

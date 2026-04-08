@@ -1,0 +1,53 @@
+paths:
+  repo_root: .
+  baseline_root: baselines/external/templex98_easyref
+  output_root: outputs/baselines/easyref
+  profile_output_dir: outputs/metrics/turbocontext_gate
+  suite: turbocontext_easyref_tiny
+
+backend:
+  kind: easyref
+  base_model_path: stabilityai/stable-diffusion-xl-base-1.0
+  multimodal_llm_path: Qwen/Qwen2-VL-2B-Instruct
+  easyref_checkpoint_path: checkpoints/EasyRef/model.safetensors
+  easyref_repo_id: zongzhuofan/EasyRef
+  easyref_checkpoint_filename: model.safetensors
+  device: cuda
+  torch_dtype: float16
+  num_tokens: 64
+  use_lora: true
+  lora_rank: 128
+  cond_image_size: 336
+  local_files_only: false
+
+generation:
+  height: 1024
+  width: 1024
+  num_samples: 1
+  num_inference_steps: 30
+  scale: 1.0
+  ref_count: 4
+  overwrite: false
+  system_prompt_template: |
+    Visualize a scene that closely resembles the provided images, capturing the essence and details described in this prompt:
+  unconditional_system_prompt: |
+    Visualize a scene that closely resembles the provided images, capturing the essence and details described in this prompt:
+
+profiling:
+  ref_counts: [1, 2, 4, 8]
+
+suite:
+  items:
+    - prompt_id: easyref_smoke_aragaki_001
+      prompt: A cinematic studio portrait of the same woman, natural window light, shallow depth of field.
+      negative_prompt: A collage of images, monochrome, lowres, bad anatomy, worst quality, low quality
+      seed: 2026040801
+      reference_images:
+        - baselines/external/templex98_easyref/assets/aragaki_identity/1.jpg
+        - baselines/external/templex98_easyref/assets/aragaki_identity/2.webp
+        - baselines/external/templex98_easyref/assets/aragaki_identity/3.webp
+        - baselines/external/templex98_easyref/assets/aragaki_identity/4.jpeg
+        - baselines/external/templex98_easyref/assets/aragaki_identity/5.webp
+        - baselines/external/templex98_easyref/assets/aragaki_identity/1.jpg
+        - baselines/external/templex98_easyref/assets/aragaki_identity/2.webp
+        - baselines/external/templex98_easyref/assets/aragaki_identity/3.webp

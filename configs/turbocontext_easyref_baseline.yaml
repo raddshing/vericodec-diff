@@ -7,11 +7,11 @@ paths:
 
 backend:
   kind: easyref
-  base_model_path: stabilityai/stable-diffusion-xl-base-1.0
-  multimodal_llm_path: Qwen/Qwen2-VL-2B-Instruct
-  easyref_checkpoint_path: checkpoints/EasyRef/model.safetensors
+  base_model_path: /mnt/data/vericodec-diff/downloads/easyref_models/stable-diffusion-xl-base-1.0
+  multimodal_llm_path: /mnt/data/vericodec-diff/downloads/easyref_models/Qwen2-VL-2B-Instruct
+  easyref_checkpoint_path: checkpoints/EasyRef/pytorch_model.bin
   easyref_repo_id: zongzhuofan/EasyRef
-  easyref_checkpoint_filename: model.safetensors
+  easyref_checkpoint_filename: pytorch_model.bin
   device: cuda
   torch_dtype: float16
   num_tokens: 64
@@ -35,6 +35,7 @@ generation:
 
 profiling:
   ref_counts: [1, 2, 4, 8]
+  verify_ip_attention: false
 
 suite:
   items:

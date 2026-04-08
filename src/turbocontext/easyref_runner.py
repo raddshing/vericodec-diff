@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw
 GB = 1024**3
 DEFAULT_IMAGE_SIZE = 1024
 DEFAULT_NUM_REFERENCE_TOKENS = 64
+DEFAULT_REFERENCE_EMBED_DIM = 2048
 DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
     "Visualize a scene that closely resembles the provided images, "
     "capturing the essence and details described in this prompt:\n"
@@ -29,9 +30,14 @@ PROFILE_CSV_FIELDS = (
     "prompt_id",
     "seed",
     "ref_count",
+    "ref_tokens_cond_bytes",
+    "ref_tokens_uncond_bytes",
+    "persistent_ref_interface_bytes",
+    "persistent_ref_interface_gb",
+    "persistent_ref_interface_share",
+    "reference_encode_peak_delta_gb",
+    "reference_encode_peak_vram_gb",
     "total_peak_vram_gb",
-    "refmem_peak_vram_gb",
-    "refmem_share",
 )
 RUN_CSV_FIELDS = (
     "sample_id",
@@ -169,6 +175,7 @@ def default_easyref_config() -> dict[str, Any]:
         },
         "profiling": {
             "ref_counts": [1, 2, 4, 8],
+            "verify_ip_attention": False,
         },
         "suite": {
             "items": [
@@ -354,6 +361,7 @@ def resolve_easyref_config(repo_root: Path, raw_config: Mapping[str, Any]) -> di
         },
         "profiling": {
             "ref_counts": ref_counts,
+            "verify_ip_attention": bool(profiling.get("verify_ip_attention", False)),
         },
         "suite": {
             "items": resolved_items,
@@ -423,11 +431,55 @@ def write_profile_records_csv(path: str | Path, records: Sequence[Mapping[str, A
         writer.writeheader()
         for record in records:
             row = {field: record.get(field, "") for field in PROFILE_CSV_FIELDS}
-            for field in ("total_peak_vram_gb", "refmem_peak_vram_gb", "refmem_share"):
+            for field in (
+                "persistent_ref_interface_gb",
+                "persistent_ref_interface_share",
+                "reference_encode_peak_delta_gb",
+                "reference_encode_peak_vram_gb",
+                "total_peak_vram_gb",
+            ):
                 value = row.get(field, "")
                 if isinstance(value, (int, float)):
                     row[field] = f"{float(value):.6f}"
             writer.writerow(row)
+
+
+def build_reference_interface_metrics(
+    *,
+    ref_tokens_cond_bytes: int,
+    ref_tokens_uncond_bytes: int,
+    total_peak_vram_gb: float,
+    cond_reference_peak: Mapping[str, Any],
+    uncond_reference_peak: Mapping[str, Any],
+) -> dict[str, int | float]:
+    persistent_ref_interface_bytes = int(ref_tokens_cond_bytes) + int(ref_tokens_uncond_bytes)
+    persistent_ref_interface_gb = round(float(persistent_ref_interface_bytes) / GB, 6)
+    persistent_ref_interface_share = (
+        round(persistent_ref_interface_gb / float(total_peak_vram_gb), 6) if total_peak_vram_gb else 0.0
+    )
+    reference_encode_peak_delta_gb = round(
+        max(
+            float(cond_reference_peak["peak_delta_vram_gb"]),
+            float(uncond_reference_peak["peak_delta_vram_gb"]),
+        ),
+        6,
+    )
+    reference_encode_peak_vram_gb = round(
+        max(
+            float(cond_reference_peak["peak_vram_gb"]),
+            float(uncond_reference_peak["peak_vram_gb"]),
+        ),
+        6,
+    )
+    return {
+        "ref_tokens_cond_bytes": int(ref_tokens_cond_bytes),
+        "ref_tokens_uncond_bytes": int(ref_tokens_uncond_bytes),
+        "persistent_ref_interface_bytes": persistent_ref_interface_bytes,
+        "persistent_ref_interface_gb": persistent_ref_interface_gb,
+        "persistent_ref_interface_share": persistent_ref_interface_share,
+        "reference_encode_peak_delta_gb": reference_encode_peak_delta_gb,
+        "reference_encode_peak_vram_gb": reference_encode_peak_vram_gb,
+    }
 
 
 def _coerce_first_image(payload: Any) -> Image.Image:
@@ -447,6 +499,7 @@ class MockEasyRefBackend:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = config
         self.generation_config = dict(config["generation"])
+        self.profiling_config = dict(config["profiling"])
         self.backend_load_resident_gb = 1.75
 
     def _make_mock_image(self, spec: EasyRefRunSpec) -> Image.Image:
@@ -496,26 +549,29 @@ class MockEasyRefBackend:
                 "peak_delta_vram_gb": round(1.02 + 0.09 * ref_count, 6),
             },
         }
-        refmem_components_gb = {
-            "prompt_embeds": round(0.030 * ref_count, 6),
-            "negative_prompt_embeds": round(0.027 * ref_count, 6),
-            "pooled_prompt_embeds": 0.004,
-            "negative_pooled_prompt_embeds": 0.004,
-        }
-        refmem_peak_vram_gb = round(sum(refmem_components_gb.values()), 6)
         total_peak_vram_gb = round(
             max(component["peak_vram_gb"] for component in component_peaks_gb.values()),
             6,
         )
-        refmem_share = round(refmem_peak_vram_gb / total_peak_vram_gb, 6)
+        per_interface_tensor_bytes = (
+            int(self.generation_config["num_samples"])
+            * DEFAULT_NUM_REFERENCE_TOKENS
+            * DEFAULT_REFERENCE_EMBED_DIM
+            * 2
+        )
+        reference_interface_metrics = build_reference_interface_metrics(
+            ref_tokens_cond_bytes=per_interface_tensor_bytes,
+            ref_tokens_uncond_bytes=per_interface_tensor_bytes,
+            total_peak_vram_gb=total_peak_vram_gb,
+            cond_reference_peak=component_peaks_gb["cond_reference_encode"],
+            uncond_reference_peak=component_peaks_gb["uncond_reference_encode"],
+        )
         return {
             "measurement_mode": self.measurement_mode,
             "backend_load_resident_gb": self.backend_load_resident_gb,
             "component_peaks_gb": component_peaks_gb,
-            "refmem_components_gb": refmem_components_gb,
-            "refmem_peak_vram_gb": refmem_peak_vram_gb,
             "total_peak_vram_gb": total_peak_vram_gb,
-            "refmem_share": refmem_share,
+            **reference_interface_metrics,
         }
 
     def close(self) -> None:
@@ -567,6 +623,7 @@ class EasyRefDiffusersBackend:
         self.config = config
         self.backend_config = dict(config["backend"])
         self.generation_config = dict(config["generation"])
+        self.profiling_config = dict(config["profiling"])
         self.repo_root = Path(config["paths"]["repo_root"])
         self.baseline_root = Path(config["paths"]["baseline_root"])
         self.torch = self._load_torch()
@@ -574,6 +631,13 @@ class EasyRefDiffusersBackend:
         self.easyref_cls, self.generator_factory = self._load_easyref_support()
         self.pipe = self._load_pipeline()
         self.easyref = self._load_easyref()
+        self.ip_attention_verification_records: list[dict[str, Any]] = []
+        self._ip_attention_verification_enabled = bool(
+            self.profiling_config.get("verify_ip_attention", False)
+        )
+        self._ip_attention_verification_processor_count = 0
+        if self._ip_attention_verification_enabled:
+            self._install_ip_attention_verification_hooks()
         self.memory_tracker = CudaMemoryTracker(self.torch, self.backend_config["device"])
         if not self.memory_tracker.is_available():
             raise EasyRefBackendUnavailableError("CUDA is required for EasyRef VRAM profiling")
@@ -700,6 +764,27 @@ class EasyRefDiffusersBackend:
             return int(numel()) * int(element_size())
         raise EasyRefRunnerError(f"Could not measure tensor bytes for {type(tensor).__name__}")
 
+    def _install_ip_attention_verification_hooks(self) -> None:
+        processors = getattr(getattr(self.easyref.pipe, "unet", None), "attn_processors", {})
+        processor_count = 0
+
+        for processor_name, processor in getattr(processors, "items", lambda: [])():
+            if processor.__class__.__name__ not in {"IPAttnProcessor2_0", "LoRAIPAttnProcessor2_0"}:
+                continue
+
+            processor_count += 1
+
+            def _record(payload: Mapping[str, Any], *, name: str = str(processor_name)) -> None:
+                if any(record.get("processor_name") == name for record in self.ip_attention_verification_records):
+                    return
+                payload_record = dict(payload)
+                payload_record["processor_name"] = name
+                self.ip_attention_verification_records.append(payload_record)
+
+            setattr(processor, "ip_attention_verification_hook", _record)
+
+        self._ip_attention_verification_processor_count = processor_count
+
     def _cleanup_after_run(self) -> None:
         gc.collect()
         if hasattr(self.torch.cuda, "empty_cache"):
@@ -729,6 +814,7 @@ class EasyRefDiffusersBackend:
         system_prompts = self._system_prompts(spec.prompt)
         negative_prompt = spec.negative_prompt or DEFAULT_NEGATIVE_PROMPT
         self.easyref.set_scale(float(self.generation_config["scale"]))
+        self.ip_attention_verification_records = []
 
         image_prompt_embeds, cond_reference_peak = self.memory_tracker.measure_span(
             lambda: self.easyref.get_image_embeds(reference_images, system_prompts[0])
@@ -772,11 +858,6 @@ class EasyRefDiffusersBackend:
             }
 
         conditioning, prompt_conditioning_peak = self.memory_tracker.measure_span(build_conditioning)
-        refmem_components_gb = {
-            name: round(self._tensor_nbytes(tensor) / GB, 6)
-            for name, tensor in conditioning.items()
-        }
-        refmem_peak_vram_gb = round(sum(refmem_components_gb.values()), 6)
         generator = self.generator_factory(int(spec.seed), self.backend_config["device"])
 
         def run_pipe() -> Any:
@@ -802,7 +883,13 @@ class EasyRefDiffusersBackend:
             ),
             6,
         )
-        refmem_share = round(refmem_peak_vram_gb / total_peak_vram_gb, 6) if total_peak_vram_gb else 0.0
+        reference_interface_metrics = build_reference_interface_metrics(
+            ref_tokens_cond_bytes=self._tensor_nbytes(image_prompt_embeds),
+            ref_tokens_uncond_bytes=self._tensor_nbytes(uncond_image_prompt_embeds),
+            total_peak_vram_gb=total_peak_vram_gb,
+            cond_reference_peak=cond_reference_peak,
+            uncond_reference_peak=uncond_reference_peak,
+        )
         image = _coerce_first_image(images)
 
         del conditioning
@@ -818,10 +905,14 @@ class EasyRefDiffusersBackend:
                 "prompt_conditioning": prompt_conditioning_peak,
                 "diffusion_decode": diffusion_decode_peak,
             },
-            "refmem_components_gb": refmem_components_gb,
-            "refmem_peak_vram_gb": refmem_peak_vram_gb,
             "total_peak_vram_gb": total_peak_vram_gb,
-            "refmem_share": refmem_share,
+            **reference_interface_metrics,
+            "ip_attention_verification": {
+                "enabled": self._ip_attention_verification_enabled,
+                "matched_processor_count": self._ip_attention_verification_processor_count,
+                "record_count": len(self.ip_attention_verification_records),
+                "records": list(self.ip_attention_verification_records),
+            },
             "image": image,
         }
 
@@ -928,14 +1019,27 @@ def profile_easyref_refmem(config: Mapping[str, Any], *, backend: Any | None = N
                         "prompt_id": spec.prompt_id,
                         "seed": spec.seed,
                         "ref_count": spec.ref_count,
+                        "ref_tokens_cond_bytes": int(result["ref_tokens_cond_bytes"]),
+                        "ref_tokens_uncond_bytes": int(result["ref_tokens_uncond_bytes"]),
+                        "persistent_ref_interface_bytes": int(result["persistent_ref_interface_bytes"]),
+                        "persistent_ref_interface_gb": round(
+                            float(result["persistent_ref_interface_gb"]), 6
+                        ),
+                        "persistent_ref_interface_share": round(
+                            float(result["persistent_ref_interface_share"]), 6
+                        ),
+                        "reference_encode_peak_delta_gb": round(
+                            float(result["reference_encode_peak_delta_gb"]), 6
+                        ),
+                        "reference_encode_peak_vram_gb": round(
+                            float(result["reference_encode_peak_vram_gb"]), 6
+                        ),
                         "total_peak_vram_gb": round(float(result["total_peak_vram_gb"]), 6),
-                        "refmem_peak_vram_gb": round(float(result["refmem_peak_vram_gb"]), 6),
-                        "refmem_share": round(float(result["refmem_share"]), 6),
                         "measurement_mode": measurement_mode,
                         "backend_load_resident_gb": round(float(result["backend_load_resident_gb"]), 6),
                         "component_peaks_gb": result["component_peaks_gb"],
-                        "refmem_components_gb": result["refmem_components_gb"],
                         "profiling_seconds": round(profiling_seconds, 6),
+                        "ip_attention_verification": result.get("ip_attention_verification"),
                     }
                 )
     finally:

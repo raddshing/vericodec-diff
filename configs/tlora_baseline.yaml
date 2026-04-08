@@ -1,0 +1,50 @@
+paths:
+  repo_root: .
+  registry_lock: baselines/registry.lock.json
+  baseline_root: baselines/external/controlgenai_t-lora
+  train_script: baselines/external/controlgenai_t-lora/train.py
+  output_root: outputs/baselines/t_lora
+  accelerate_config: configs/accelerate/single_gpu_fp16.yaml
+
+accelerate:
+  executable: accelerate
+
+model:
+  pretrained_model_name_or_path: stabilityai/stable-diffusion-xl-base-1.0
+  revision: null
+
+dataset:
+  train_data_dir: baselines/external/controlgenai_t-lora/dog_example
+  class_data_dir: null
+  class_name: dog
+  placeholder_token: sks
+  validation_prompts: a {0} lying in the bed#a {0} swimming#a {0} dressed as a ballerina
+  num_val_imgs_per_prompt: 3
+  with_prior_preservation: false
+  prior_loss_weight: 1.0
+  one_image: 02.jpg
+
+run:
+  name: dog_example
+  wandb_api_key_env: WANDB_API_KEY
+  pass_wandb_api_key: false
+
+training:
+  trainer_type: ortho_lora
+  trainer_class: sdxl_tlora
+  mixed_precision: fp16
+  num_train_epochs: 800
+  checkpointing_steps: 100
+  resolution: 1024
+  train_batch_size: 1
+  dataloader_num_workers: 1
+  seed: 0
+  lora_rank: 64
+  min_rank: 32
+  sig_type: last
+  alpha_rank_scale: 1.0
+  learning_rate: 0.0001
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.0001
+  adam_epsilon: 0.00000001

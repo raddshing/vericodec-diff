@@ -1,0 +1,49 @@
+paths:
+  repo_root: .
+  registry_lock: baselines/registry.lock.json
+  baseline_root: baselines/external/csguoh_intlora
+  train_script: baselines/external/csguoh_intlora/train_dreambooth_quant.py
+  output_root: outputs/baselines/int_lora
+
+python:
+  executable: python
+
+model:
+  pretrained_model_name_or_path: runwayml/stable-diffusion-v1-5
+  revision: null
+
+dataset:
+  instance_data_dir: tests/fixtures/rdlora_pilot
+  class_data_dir: null
+  instance_prompt: a photo of qwe subject
+  class_prompt: null
+  validation_prompt: a qwe subject in studio light
+  test_prompt: a subject in studio light
+  with_prior_preservation: false
+  prior_loss_weight: 1.0
+  num_class_images: 200
+
+run:
+  name: sd15_appendix_smoke
+
+training:
+  rank: 4
+  intlora: MUL
+  nbits: 8
+  use_activation_quant: true
+  act_nbits: 8
+  resolution: 512
+  center_crop: false
+  train_batch_size: 1
+  gradient_accumulation_steps: 1
+  checkpointing_steps: 5000
+  learning_rate: 0.00006
+  report_to: none
+  lr_scheduler: constant
+  lr_warmup_steps: 0
+  max_train_steps: 2000
+  num_validation_images: 5
+  validation_epochs: 1
+  seed: 0
+  name: appendix_subject
+  gradient_checkpointing: false

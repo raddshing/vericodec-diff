@@ -190,7 +190,8 @@
       "default_branch": "main",
       "pinned_commit": "65a8257a4311e0feab9b33477c9748d13d8ce17b",
       "local_checkout_path": "baselines/external/csguoh_intlora",
-      "status": "available",
+      "status": "appendix-only",
+      "critical_path": false,
       "expected_weights": [
         "Stable Diffusion 1.5 pretrained weights",
         "DreamBooth subject-driven generation dataset"
@@ -200,6 +201,11 @@
         "train_dreambooth_quant.sh",
         "evaluation.py",
         "get_results.py"
+      ],
+      "launch_notes": [
+        "Use the official train_dreambooth_quant.py or train_dreambooth_quant.sh flow without attempting an SDXL port.",
+        "Keep this baseline in its own SD1.5 appendix lane with 512 resolution and quantized DreamBooth settings.",
+        "Do not let IntLoRA block the week-2 SDXL gate unless an official SDXL path becomes obviously trivial."
       ],
       "environment_notes": [
         "Upstream ships environment.yaml for Python 3.9.18, CUDA 11.8, PyTorch 2.1.0, diffusers 0.26.0, accelerate 0.25.0, and peft 0.7.1.",
@@ -292,12 +298,18 @@
       "pinned_commit": "12f36f361bbb6e32e3bb3efc95bdf60db9b14fdd",
       "local_checkout_path": "baselines/external/controlgenai_t-lora",
       "status": "available",
+      "critical_path": true,
       "expected_weights": [
         "stabilityai/stable-diffusion-xl-base-1.0"
       ],
       "entrypoints": [
         "train.py",
         "inference.py"
+      ],
+      "launch_notes": [
+        "Use the official SDXL train.py and inference.py entrypoints from the upstream checkout.",
+        "Keep resolution fixed at 1024 and stay on the SDXL path documented in the README.",
+        "This is the only critical-path external week-2 baseline."
       ],
       "environment_notes": [
         "Upstream ships tlora_env.yml with Python 3.11.11, diffusers 0.25.1, accelerate 0.26.1, torch 2.6.0, torchvision 0.21.0, transformers 4.37.1, and peft 0.7.0.",

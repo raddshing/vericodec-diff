@@ -6,6 +6,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+.codex
 .env
 .venv/
 logs/
@@ -14,6 +15,10 @@ checkpoints/
 baselines/external/
 data/raw/
 data/processed/
+data/manifests/real_images_manifest.csv
+data/manifests/reconstruction_records.csv
+data/manifests/synthetic_manifest.csv
+sana_smoke.png
 figures/final/
 paper/build/
 *.pt

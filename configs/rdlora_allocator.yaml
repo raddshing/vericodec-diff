@@ -1,0 +1,47 @@
+paths:
+  repo_root: .
+  probe_run_dir: outputs/rd_lora/probe/stageb_cpu_smoke
+  output_root: outputs/rd_lora/allocator
+  accelerate_config: configs/accelerate/single_gpu_fp16.yaml
+
+run:
+  name: stagec_smoke
+  seed: 20260409
+
+preflight:
+  require_torch_cuda: true
+  required_diffusers_version: 0.38.0.dev0
+  required_accelerate_config: configs/accelerate/single_gpu_fp16.yaml
+
+surrogate:
+  feature_names:
+    - candidate_rank
+    - rank_fraction_of_max
+    - is_attention_cell
+    - layer_count
+    - step_count
+    - event_count
+    - baseline_mean_abs_drift
+    - mean_abs_drift
+    - rms_drift
+    - max_abs_drift
+    - cosine_distance
+    - baseline_attention_output_mean_abs_drift
+    - attention_output_mean_abs_drift
+    - attention_output_rms_drift
+    - attention_output_max_abs_drift
+    - attention_output_cosine_distance
+    - mean_abs_improvement
+    - attention_mean_abs_improvement
+    - has_attention_measurements
+  l2_regularization: 1.0e-6
+  clip_min_utility: 0.0
+  round_digits: 6
+
+allocation:
+  budget: 96
+  cost_field: candidate_rank
+  utility_field: predicted_utility
+  utility_scale: 1000000
+  max_exact_state_count: 500000
+  fallback_mode: deterministic_greedy

@@ -1,0 +1,17 @@
+version: 1
+
+defaults:
+  prepared_root: outputs/rd_lora/pilot_data
+  image_size: 1024
+  image_column: image
+  caption_column: text
+
+tasks:
+  smoke_portrait:
+    concept_name: fixture_smoke_portrait
+    validation_prompt: A clean studio portrait of the same person, soft window light, shallow depth of field.
+    train_records:
+      - image: tests/fixtures/rdlora_pilot/portrait_001.ppm
+        caption: A head-and-shoulders portrait of a person looking at the camera, soft studio light.
+      - image: tests/fixtures/rdlora_pilot/portrait_002.ppm
+        caption: A close-up portrait of the same person with neutral expression, natural light.

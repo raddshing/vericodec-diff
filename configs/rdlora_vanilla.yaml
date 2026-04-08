@@ -1,0 +1,69 @@
+paths:
+  repo_root: .
+  official_script: baselines/external/huggingface_diffusers/examples/text_to_image/train_text_to_image_lora_sdxl.py
+  tasks_config: configs/rdlora_tasks.yaml
+  prepared_data_root: outputs/rd_lora/pilot_data
+  run_root: outputs/rd_lora/vanilla
+  smoke_root: outputs/rd_lora/smoke
+  cache_dir: null
+
+accelerate:
+  executable: accelerate
+  launch:
+    config_file: null
+    num_processes: 1
+
+model:
+  pretrained_model_name_or_path: stabilityai/stable-diffusion-xl-base-1.0
+  pretrained_vae_model_name_or_path: null
+  revision: null
+  variant: null
+
+dataset:
+  image_column: image
+  caption_column: text
+
+run:
+  name: vanilla_lora
+  validation_prompt: null
+
+training:
+  resolution: 1024
+  center_crop: true
+  random_flip: false
+  train_text_encoder: false
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  max_train_steps: 100
+  checkpointing_steps: 25
+  checkpoints_total_limit: 2
+  learning_rate: 0.0001
+  lr_scheduler: constant
+  lr_warmup_steps: 0
+  gradient_checkpointing: false
+  scale_lr: false
+  allow_tf32: false
+  rank: 8
+  seed: 20260408
+  report_to: tensorboard
+  mixed_precision: fp16
+  num_validation_images: 1
+  validation_epochs: 1
+  dataloader_num_workers: 0
+  max_train_samples: null
+  use_8bit_adam: false
+  enable_xformers_memory_efficient_attention: false
+
+smoke:
+  task_id: smoke_portrait
+  run_name: smoke
+  validation_prompt: null
+  train_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_train_steps: 1
+  checkpointing_steps: 1
+  checkpoints_total_limit: 1
+  mixed_precision: "no"
+  num_validation_images: 1
+  dataloader_num_workers: 0
+  report_to: tensorboard

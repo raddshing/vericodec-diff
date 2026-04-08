@@ -1,0 +1,31 @@
+name: easyref-env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.3.1
+  - torchvision=0.18.1
+  - pytorch-cuda=12.1
+  - pip
+  - git
+  - git-lfs
+  - numpy
+  - pillow
+  - jupyterlab
+  - ipykernel
+  - pip:
+      - diffusers==0.22.1
+      - transformers==4.45.2
+      - qwen_vl_utils==0.0.8
+      - accelerate
+      - safetensors
+      - einops
+      - omegaconf
+      - peft
+      - pillow-avif-plugin
+      - huggingface-hub==0.23.3
+      - opencv-python
+      - gradio
+      - deepspeed

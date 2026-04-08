@@ -2,6 +2,35 @@
   "schema_version": 1,
   "baselines": [
     {
+      "id": "cachequant",
+      "name": "CacheQuant",
+      "upstream_url": "https://github.com/BienLuky/CacheQuant.git",
+      "default_branch": "main",
+      "pinned_commit": "9470ddf1bac09337ce3281f797357ac35997a358",
+      "local_checkout_path": "baselines/external/bienluky_cachequant",
+      "status": "partial",
+      "expected_weights": [
+        "CompVis latent-diffusion cin256-v2 checkpoint placed under mainldm/models/ldm",
+        "Stable Diffusion weights installed per https://github.com/CompVis/stable-diffusion#weights",
+        "Original evaluation datasets from their official sources"
+      ],
+      "entrypoints": [
+        "mainldm/sample_cachequant_imagenet_cali.py",
+        "mainldm/sample_cachequant_imagenet_predadd.py",
+        "mainldm/sample_cachequant_imagenet_params.py",
+        "mainldm/sample_cachequant_imagenet_quant.py",
+        "mainldm/sample_cachequant_stable_quant.py"
+      ],
+      "environment_notes": [
+        "Upstream ships environment.yaml targeting Python 3.8.5, PyTorch 1.7.0, and CUDA 11.0.",
+        "README example commands point to err_add/... but the checkout uses error_dec/...; manual path correction is required.",
+        "DDPM checkpoints are auto-downloaded by code, but LDM and Stable Diffusion weights must be placed manually."
+      ],
+      "reason": "Not on the critical reproduction path because CacheQuant is a global caching and quantization accelerator, not a frozen-backbone verifier plus sparse repair baseline.",
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    },
+    {
       "id": "d2it",
       "name": "Dynamic-DiT (D2iT)",
       "upstream_url": "https://github.com/jiawn-creator/Dynamic-DiT.git",
@@ -18,6 +47,36 @@
       "reason": "Official checkout contains only README.md with 'Coming soon!' and no runnable code, setup files, scripts, or released weights.",
       "proxy_baseline_id": "ras",
       "proxy_checkout_path": "baselines/external/microsoft_ras"
+    },
+    {
+      "id": "dreamcache",
+      "name": "DreamCache",
+      "upstream_url": "https://github.com/Emanuele97x/DreamCache.git",
+      "default_branch": "main",
+      "pinned_commit": "a0e33b333f7d448d56018a450c4dd99610e85142",
+      "local_checkout_path": "baselines/external/emanuele97x_dreamcache",
+      "status": "partial",
+      "expected_weights": [
+        "Stable Diffusion 2.1 base checkpoint v2-1_512-ema-pruned.ckpt under models/ldm/stable_diffusion_v2",
+        "DreamCache pretrained adapter from the upstream Google Drive link",
+        "DreamCache synthetic dataset from the upstream Dropbox link",
+        "DreamBench checkout cloned from https://github.com/google/dreambooth.git"
+      ],
+      "entrypoints": [
+        "scripts/train_multi_masked.sh",
+        "scripts/sample_ref.sh",
+        "scripts/generate_dreambooth_mult.sh",
+        "scripts/evaluate_dreambooth.sh",
+        "scripts/gradio_app.py"
+      ],
+      "environment_notes": [
+        "Upstream ships environment_dreamcache.yml rather than the environment.yaml filename used in the README.",
+        "Launch scripts contain placeholder checkpoint and dataset paths that must be edited before use.",
+        "Training and inference target Stable Diffusion 2.1 plus a learned DreamCache adapter."
+      ],
+      "reason": "Not on the critical reproduction path because DreamCache targets personalized generation via feature caching and adapter training, not patchwise failure localization or sparse repair.",
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
     },
     {
       "id": "ect",
@@ -37,10 +96,38 @@
       ],
       "environment_notes": [
         "Upstream README and env.yml target Python 3.9.18 and PyTorch 2.3.0.",
-        "Pinned local checkout is the `main` branch for CIFAR-10; upstream also documents an `imgnet` branch for ImageNet 64x64.",
+        "Pinned local checkout is the main branch for CIFAR-10; upstream also documents an imgnet branch for ImageNet 64x64.",
         "Repo-local environment/ect-env.yaml is the closest tracked environment match."
       ],
       "reason": null,
+      "proxy_baseline_id": null,
+      "proxy_checkout_path": null
+    },
+    {
+      "id": "easyref",
+      "name": "EasyRef",
+      "upstream_url": "https://github.com/TempleX98/EasyRef.git",
+      "default_branch": "main",
+      "pinned_commit": "c8aa6b7703eafcf4ea5106494f3c61bcee6eb62a",
+      "local_checkout_path": "baselines/external/templex98_easyref",
+      "status": "available",
+      "expected_weights": [
+        "Hugging Face checkpoint repo zongzhuofan/EasyRef cloned into checkpoints",
+        "stabilityai/stable-diffusion-xl-base-1.0",
+        "Qwen/Qwen2-VL-2B-Instruct"
+      ],
+      "entrypoints": [
+        "easyref_demo.ipynb",
+        "scripts/alignment_pretraining.sh",
+        "scripts/single_ref_finetuning.sh",
+        "scripts/multi_ref_finetuning.sh"
+      ],
+      "environment_notes": [
+        "Upstream requirements pin diffusers 0.22.1, torch 2.3.1, torchvision 0.18.1, and transformers 4.45.2.",
+        "Repo-local environment/easyref-env.yaml mirrors the upstream package set and adds git-lfs plus deepspeed for model fetches and training launch scripts.",
+        "Upstream demo and training scripts target 1024 resolution with SDXL plus Qwen2-VL-2B-Instruct."
+      ],
+      "reason": "Not on the critical reproduction path because EasyRef is a multimodal reference-conditioned personalization system built on SDXL and Qwen, not a compressed latent diffusion repair baseline.",
       "proxy_baseline_id": null,
       "proxy_checkout_path": null
     },
@@ -65,7 +152,7 @@
         "applications/dc_ae/train_dc_ae_diffusion_model.py"
       ],
       "environment_notes": [
-        "Upstream README suggests `conda create -n efficientvit python=3.10` then `pip install -U -r requirements.txt`.",
+        "Upstream README suggests conda create -n efficientvit python=3.10 then pip install -U -r requirements.txt.",
         "No dedicated repo-local environment YAML exists for EfficientViT or DC-AE."
       ],
       "reason": null,
@@ -89,8 +176,8 @@
         "scripts/Lumina_Next_T2I_example.sh"
       ],
       "environment_notes": [
-        "Upstream README suggests `conda create -n ras python=3.12`, `python setup.py install`, and `pip install flash-attn --no-build-isolation`.",
-        "The Stable Diffusion 3 example in the README uses `use_auth_token=True` for the upstream model load.",
+        "Upstream README suggests conda create -n ras python=3.12, python setup.py install, and pip install flash-attn --no-build-isolation.",
+        "The Stable Diffusion 3 example in the README uses use_auth_token=True for the upstream model load.",
         "PyCuda is only needed when enabling index fusion."
       ],
       "reason": null,
@@ -113,7 +200,7 @@
         "app/app_sana.py"
       ],
       "environment_notes": [
-        "Upstream quick start uses `./environment_setup.sh sana`.",
+        "Upstream quick start uses ./environment_setup.sh sana.",
         "Repo-local environment/sana-env.yaml already includes diffusers support for SanaPipeline."
       ],
       "reason": null,

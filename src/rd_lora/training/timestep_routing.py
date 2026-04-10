@@ -2,61 +2,121 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from rd_lora.cells import build_cell_schema
+from rd_lora.cells import CellSchema, build_cell_schema
 
 
 class TimestepRoutingError(ValueError):
-    """Raised when timestep-band routing metadata is inconsistent."""
+    """Raised when manifest timestep-band routing is inconsistent with the current cell schema."""
 
 
-def build_timestep_band_routes(timestep_bands: Sequence[str] | None = None) -> dict[str, list[int]]:
-    schema = build_cell_schema()
-    available = {band.band_id: list(band.step_indices) for band in schema.timestep_bands}
-    if timestep_bands is None:
-        return available
-    routes: dict[str, list[int]] = {}
-    for band_id in timestep_bands:
-        normalized = str(band_id).strip()
-        if normalized not in available:
-            raise TimestepRoutingError(f"Unknown timestep band {normalized!r}")
-        routes[normalized] = list(available[normalized])
+def _schema_band_lookup(schema: CellSchema) -> dict[str, dict[str, list[int]]]:
+    return {
+        band.band_id: {
+            "step_indices": list(band.step_indices),
+            "timestep_values": list(band.timestep_values),
+        }
+        for band in schema.timestep_bands
+    }
+
+
+def build_timestep_band_routes(
+    timestep_bands: Sequence[str],
+    *,
+    schema: CellSchema | None = None,
+) -> dict[str, dict[str, list[int]]]:
+    active_schema = schema or build_cell_schema()
+    available = _schema_band_lookup(active_schema)
+    routes: dict[str, dict[str, list[int]]] = {}
+    for raw_band_name in timestep_bands:
+        band_name = str(raw_band_name).strip()
+        if band_name not in available:
+            raise TimestepRoutingError(
+                f"Unknown timestep_band {band_name!r}; available={sorted(available)}"
+            )
+        routes[band_name] = {
+            "step_indices": list(available[band_name]["step_indices"]),
+            "timestep_values": list(available[band_name]["timestep_values"]),
+        }
     return routes
 
 
-def build_step_to_band_map(routes: Mapping[str, Sequence[int]]) -> dict[int, str]:
-    step_to_band: dict[int, str] = {}
-    for band_id, step_indices in routes.items():
-        for step_index in step_indices:
-            parsed = int(step_index)
-            if parsed in step_to_band:
-                raise TimestepRoutingError(f"Step index {parsed} is assigned to multiple timestep bands")
-            step_to_band[parsed] = str(band_id)
-    return step_to_band
+def build_adapter_routing_table(
+    routes: Mapping[str, Mapping[str, Sequence[int]]],
+    *,
+    band_to_adapter: Mapping[str, str],
+) -> dict[str, dict[str, Any]]:
+    table: dict[str, dict[str, Any]] = {}
+    for band_name, route in routes.items():
+        adapter_name = str(band_to_adapter.get(str(band_name), "")).strip()
+        if not adapter_name:
+            raise TimestepRoutingError(f"Missing adapter_name for timestep_band {band_name!r}")
+        table[str(band_name)] = {
+            "adapter_name": adapter_name,
+            "step_indices": [int(value) for value in route["step_indices"]],
+            "timestep_values": [int(value) for value in route["timestep_values"]],
+        }
+    return table
 
 
-def build_adapter_step_map(routes: Mapping[str, Sequence[int]], *, band_to_adapter: Mapping[str, str]) -> dict[int, str]:
-    step_to_band = build_step_to_band_map(routes)
-    adapter_step_map: dict[int, str] = {}
-    for step_index, band_id in step_to_band.items():
-        if band_id not in band_to_adapter:
-            raise TimestepRoutingError(f"Missing adapter for timestep band {band_id!r}")
-        adapter_step_map[step_index] = str(band_to_adapter[band_id])
-    return adapter_step_map
+def resolve_timestep_band_name(
+    routing_table: Mapping[str, Mapping[str, Sequence[int]]],
+    *,
+    step_index: int | None = None,
+    timestep_value: int | None = None,
+) -> str:
+    provided = int(step_index is not None) + int(timestep_value is not None)
+    if provided != 1:
+        raise TimestepRoutingError("Specify exactly one of step_index or timestep_value")
+
+    matches: list[str] = []
+    for band_name, route in routing_table.items():
+        values = route["step_indices"] if step_index is not None else route["timestep_values"]
+        candidate = int(step_index if step_index is not None else timestep_value)
+        if candidate in {int(value) for value in values}:
+            matches.append(str(band_name))
+
+    if len(matches) != 1:
+        candidate_name = "step_index" if step_index is not None else "timestep_value"
+        candidate_value = step_index if step_index is not None else timestep_value
+        raise TimestepRoutingError(
+            f"{candidate_name}={candidate_value} mapped to {len(matches)} bands; matches={matches}"
+        )
+    return matches[0]
 
 
-def summarize_routes(routes: Mapping[str, Sequence[int]]) -> dict[str, Any]:
-    step_to_band = build_step_to_band_map(routes)
+def resolve_active_adapter_name(
+    routing_table: Mapping[str, Mapping[str, Sequence[int] | str]],
+    *,
+    step_index: int | None = None,
+    timestep_value: int | None = None,
+) -> str:
+    band_name = resolve_timestep_band_name(
+        routing_table,
+        step_index=step_index,
+        timestep_value=timestep_value,
+    )
+    adapter_name = str(routing_table[band_name].get("adapter_name", "")).strip()
+    if not adapter_name:
+        raise TimestepRoutingError(f"Routing entry for {band_name!r} is missing adapter_name")
+    return adapter_name
+
+
+def describe_routing_table(routing_table: Mapping[str, Mapping[str, Sequence[int] | str]]) -> dict[str, Any]:
     return {
-        "timestep_bands": sorted(str(key) for key in routes),
-        "step_count": len(step_to_band),
-        "step_to_band": {str(step): band for step, band in sorted(step_to_band.items())},
+        "timestep_bands": list(routing_table),
+        "mapped_timestep_total": sum(len(route["step_indices"]) for route in routing_table.values()),
+        "adapter_names": {
+            str(band_name): str(route["adapter_name"])
+            for band_name, route in routing_table.items()
+        },
     }
 
 
 __all__ = [
     "TimestepRoutingError",
-    "build_adapter_step_map",
-    "build_step_to_band_map",
+    "build_adapter_routing_table",
     "build_timestep_band_routes",
-    "summarize_routes",
+    "describe_routing_table",
+    "resolve_active_adapter_name",
+    "resolve_timestep_band_name",
 ]

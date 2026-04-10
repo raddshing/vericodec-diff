@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Sequence
 
 
@@ -10,13 +11,14 @@ DEFAULT_NUM_INFERENCE_STEPS = 20
 DEFAULT_CANDIDATE_RANKS = (0, 2, 4, 8, 16)
 DEFAULT_TARGET_MODULES = ("to_k", "to_q", "to_v", "to_out.0")
 DEFAULT_LAYER_GROUP_LAYER_IDS = (
-    ("down_blocks.0.attentions.0", "down_blocks.0.attentions.1"),
     ("down_blocks.1.attentions.0", "down_blocks.1.attentions.1"),
     ("down_blocks.2.attentions.0", "down_blocks.2.attentions.1"),
-    ("mid_block.attentions.0", "up_blocks.0.attentions.0"),
-    ("up_blocks.0.attentions.1", "up_blocks.0.attentions.2", "up_blocks.1.attentions.0"),
+    ("mid_block.attentions.0",),
+    ("up_blocks.0.attentions.0", "up_blocks.0.attentions.1"),
+    ("up_blocks.0.attentions.2", "up_blocks.1.attentions.0"),
     ("up_blocks.1.attentions.1", "up_blocks.1.attentions.2"),
 )
+_ATTENTION_BLOCK_PATTERN = re.compile(r"^(.*?\.attentions\.\d+)(?:\.|$)")
 
 
 @dataclass(frozen=True)
@@ -263,6 +265,25 @@ def _enumerate_target_module_names(unet: Any, target_modules: Sequence[str]) -> 
     return tuple(sorted(matched))
 
 
+def discover_valid_attention_blocks(unet: Any) -> tuple[str, ...]:
+    suffixes = _normalize_target_modules(DEFAULT_TARGET_MODULES)
+    discovered: list[str] = []
+    seen_blocks: set[str] = set()
+
+    for module_name, _module in unet.named_modules():
+        if not any(module_name.endswith(f".{suffix}") or module_name == suffix for suffix in suffixes):
+            continue
+        match = _ATTENTION_BLOCK_PATTERN.match(module_name)
+        if match is None:
+            continue
+        block_name = match.group(1)
+        if block_name in seen_blocks:
+            continue
+        seen_blocks.add(block_name)
+        discovered.append(block_name)
+    return tuple(discovered)
+
+
 def _match_block_module_names(module_names: Sequence[str], layer_ids: Sequence[str]) -> tuple[str, ...]:
     prefixes = tuple(str(layer_id) for layer_id in layer_ids)
     return tuple(
@@ -302,20 +323,38 @@ def build_layer_groups(
     return tuple(groups)
 
 
+def validate_layer_groups(
+    layer_groups: Sequence[LayerGroup],
+    discovered_blocks: Sequence[str],
+) -> None:
+    discovered = tuple(str(block).strip() for block in discovered_blocks if str(block).strip())
+    if not discovered:
+        raise ValueError("discovered_blocks must not be empty")
+
+    discovered_set = set(discovered)
+    assigned_blocks: set[str] = set()
+    for group in layer_groups:
+        if not group.layer_ids:
+            raise ValueError(f"{group.group_id} must not be empty")
+        for layer_id in group.layer_ids:
+            if layer_id not in discovered_set:
+                raise ValueError(f"{group.group_id} references block {layer_id!r}, but it does not exist in the UNet")
+            if layer_id in assigned_blocks:
+                raise ValueError(f"Duplicate layer_id across groups: {layer_id!r}")
+            assigned_blocks.add(layer_id)
+
+
 def validate_layer_group_inventory(unet: Any) -> dict[str, tuple[str, ...]]:
     module_names = _enumerate_target_module_names(unet, DEFAULT_TARGET_MODULES)
     if not module_names:
         raise ValueError(f"UNet inventory did not expose any modules for target_modules={DEFAULT_TARGET_MODULES!r}")
 
+    groups = build_layer_groups(default_layer_catalog())
+    validate_layer_groups(groups, discover_valid_attention_blocks(unet))
+
     inventory: dict[str, tuple[str, ...]] = {}
-    seen_layer_ids: set[str] = set()
-    for group in build_layer_groups(default_layer_catalog()):
-        if not group.layer_ids:
-            raise ValueError(f"{group.group_id} must not be empty")
+    for group in groups:
         for layer_id in group.layer_ids:
-            if layer_id in seen_layer_ids:
-                raise ValueError(f"Duplicate layer_id across groups: {layer_id!r}")
-            seen_layer_ids.add(layer_id)
             matched = _match_block_module_names(module_names, (layer_id,))
             if not matched:
                 raise ValueError(f"{group.group_id} references block {layer_id!r}, but it does not exist in the UNet")
@@ -421,7 +460,7 @@ def build_cell_schema(
         _cell_lookup=cell_lookup,
     )
     if unet is not None:
-        validate_layer_group_inventory(unet)
+        validate_layer_groups(groups, discover_valid_attention_blocks(unet))
         validate_cell_targets(schema, unet, target_modules)
     return schema
 
@@ -440,11 +479,13 @@ __all__ = [
     "build_cell_schema",
     "build_layer_groups",
     "build_timestep_bands",
+    "discover_valid_attention_blocks",
     "default_layer_catalog",
     "parse_candidate_ranks_argument",
     "resolve_candidate_ranks",
     "resolve_layer_catalog",
     "resolve_timestep_values",
     "validate_cell_targets",
+    "validate_layer_groups",
     "validate_layer_group_inventory",
 ]

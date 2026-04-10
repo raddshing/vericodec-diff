@@ -16,8 +16,10 @@ from rd_lora.cells import (
     DEFAULT_CANDIDATE_RANKS,
     DEFAULT_TARGET_MODULES,
     build_cell_schema,
+    discover_valid_attention_blocks,
     parse_candidate_ranks_argument,
     validate_cell_targets,
+    validate_layer_groups,
     validate_layer_group_inventory,
 )
 from rd_lora.features import (
@@ -30,13 +32,16 @@ from rd_lora.features import (
 
 RUN_SCRIPT = REPO_ROOT / "scripts" / "run_rdlora_probe.py"
 EXPECTED_LAYER_GROUPS = {
-    "layer_group_00": ("down_blocks.0.attentions.0", "down_blocks.0.attentions.1"),
-    "layer_group_01": ("down_blocks.1.attentions.0", "down_blocks.1.attentions.1"),
-    "layer_group_02": ("down_blocks.2.attentions.0", "down_blocks.2.attentions.1"),
-    "layer_group_03": ("mid_block.attentions.0", "up_blocks.0.attentions.0"),
-    "layer_group_04": ("up_blocks.0.attentions.1", "up_blocks.0.attentions.2", "up_blocks.1.attentions.0"),
+    "layer_group_00": ("down_blocks.1.attentions.0", "down_blocks.1.attentions.1"),
+    "layer_group_01": ("down_blocks.2.attentions.0", "down_blocks.2.attentions.1"),
+    "layer_group_02": ("mid_block.attentions.0",),
+    "layer_group_03": ("up_blocks.0.attentions.0", "up_blocks.0.attentions.1"),
+    "layer_group_04": ("up_blocks.0.attentions.2", "up_blocks.1.attentions.0"),
     "layer_group_05": ("up_blocks.1.attentions.1", "up_blocks.1.attentions.2"),
 }
+VALID_SDXL_ATTENTION_BLOCKS = tuple(
+    layer_id for layer_ids in EXPECTED_LAYER_GROUPS.values() for layer_id in layer_ids
+)
 ALL_SDXL_ATTENTION_BLOCKS = (
     "down_blocks.0.attentions.0",
     "down_blocks.0.attentions.1",
@@ -70,7 +75,7 @@ class FakeUnet:
 def _build_fake_unet(*, excluded_blocks: tuple[str, ...] = ()) -> FakeUnet:
     module_names: list[str] = []
     excluded = set(excluded_blocks)
-    for block_name in ALL_SDXL_ATTENTION_BLOCKS:
+    for block_name in VALID_SDXL_ATTENTION_BLOCKS:
         if block_name in excluded:
             continue
         module_names.extend(
@@ -92,9 +97,10 @@ def test_cell_schema_is_deterministic_and_has_24_cells() -> None:
     assert schema_a.candidate_ranks == DEFAULT_CANDIDATE_RANKS
     assert actual_groups == EXPECTED_LAYER_GROUPS
     assert all(group.layer_ids for group in schema_a.layer_groups)
+    assert "down_blocks.0.attentions.0" not in grouped_layer_ids
+    assert "down_blocks.0.attentions.1" not in grouped_layer_ids
     assert "mid_block.attentions.1" not in grouped_layer_ids
     assert "up_blocks.2.attentions.0" not in grouped_layer_ids
-    assert "up_blocks.2.attentions.1" not in grouped_layer_ids
 
 
 def test_candidate_rank_parsing_is_deterministic() -> None:
@@ -102,14 +108,25 @@ def test_candidate_rank_parsing_is_deterministic() -> None:
     assert parse_candidate_ranks_argument((0, 16, 2, 4, 8, 2)) == DEFAULT_CANDIDATE_RANKS
 
 
+def test_discover_valid_attention_blocks_returns_11_blocks_for_fake_sdxl_unet() -> None:
+    discovered_blocks = discover_valid_attention_blocks(_build_fake_unet())
+
+    assert discovered_blocks == VALID_SDXL_ATTENTION_BLOCKS
+    assert len(discovered_blocks) == 11
+    assert set(discovered_blocks).issubset(set(ALL_SDXL_ATTENTION_BLOCKS))
+
+
 def test_inventory_and_cell_target_validation_match_grouped_blocks() -> None:
     schema = build_cell_schema()
     unet = _build_fake_unet()
 
+    discovered_blocks = discover_valid_attention_blocks(unet)
+    validate_layer_groups(schema.layer_groups, discovered_blocks)
     inventory = validate_layer_group_inventory(unet)
     matches_by_cell = validate_cell_targets(schema, unet, DEFAULT_TARGET_MODULES)
 
-    assert set(inventory) == {layer_id for layer_ids in EXPECTED_LAYER_GROUPS.values() for layer_id in layer_ids}
+    assert discovered_blocks == VALID_SDXL_ATTENTION_BLOCKS
+    assert set(inventory) == set(VALID_SDXL_ATTENTION_BLOCKS)
     assert len(matches_by_cell) == 24
 
 

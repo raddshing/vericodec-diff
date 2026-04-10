@@ -12,7 +12,14 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from rd_lora.cells import DEFAULT_CANDIDATE_RANKS, build_cell_schema, parse_candidate_ranks_argument
+from rd_lora.cells import (
+    DEFAULT_CANDIDATE_RANKS,
+    DEFAULT_TARGET_MODULES,
+    build_cell_schema,
+    parse_candidate_ranks_argument,
+    validate_cell_targets,
+    validate_layer_group_inventory,
+)
 from rd_lora.features import (
     REQUIRED_PROBE_ROW_FIELDNAMES,
     REQUIRED_PROBE_SUMMARY_KEYS,
@@ -22,22 +29,100 @@ from rd_lora.features import (
 
 
 RUN_SCRIPT = REPO_ROOT / "scripts" / "run_rdlora_probe.py"
+EXPECTED_LAYER_GROUPS = {
+    "layer_group_00": ("down_blocks.0.attentions.0", "down_blocks.0.attentions.1"),
+    "layer_group_01": ("down_blocks.1.attentions.0", "down_blocks.1.attentions.1"),
+    "layer_group_02": ("down_blocks.2.attentions.0", "down_blocks.2.attentions.1"),
+    "layer_group_03": ("mid_block.attentions.0", "up_blocks.0.attentions.0"),
+    "layer_group_04": ("up_blocks.0.attentions.1", "up_blocks.0.attentions.2", "up_blocks.1.attentions.0"),
+    "layer_group_05": ("up_blocks.1.attentions.1", "up_blocks.1.attentions.2"),
+}
+ALL_SDXL_ATTENTION_BLOCKS = (
+    "down_blocks.0.attentions.0",
+    "down_blocks.0.attentions.1",
+    "down_blocks.1.attentions.0",
+    "down_blocks.1.attentions.1",
+    "down_blocks.2.attentions.0",
+    "down_blocks.2.attentions.1",
+    "mid_block.attentions.0",
+    "mid_block.attentions.1",
+    "up_blocks.0.attentions.0",
+    "up_blocks.0.attentions.1",
+    "up_blocks.0.attentions.2",
+    "up_blocks.1.attentions.0",
+    "up_blocks.1.attentions.1",
+    "up_blocks.1.attentions.2",
+    "up_blocks.2.attentions.0",
+    "up_blocks.2.attentions.1",
+)
+
+
+class FakeUnet:
+    def __init__(self, module_names: list[str]) -> None:
+        self._module_names = tuple(module_names)
+
+    def named_modules(self):  # type: ignore[no-untyped-def]
+        yield "", self
+        for module_name in self._module_names:
+            yield module_name, object()
+
+
+def _build_fake_unet(*, excluded_blocks: tuple[str, ...] = ()) -> FakeUnet:
+    module_names: list[str] = []
+    excluded = set(excluded_blocks)
+    for block_name in ALL_SDXL_ATTENTION_BLOCKS:
+        if block_name in excluded:
+            continue
+        module_names.extend(
+            f"{block_name}.transformer_blocks.0.attn1.{target_module}" for target_module in DEFAULT_TARGET_MODULES
+        )
+    return FakeUnet(module_names)
 
 
 def test_cell_schema_is_deterministic_and_has_24_cells() -> None:
     schema_a = build_cell_schema()
     schema_b = build_cell_schema()
+    actual_groups = {group.group_id: group.layer_ids for group in schema_a.layer_groups}
+    grouped_layer_ids = {layer_id for layer_ids in actual_groups.values() for layer_id in layer_ids}
 
     assert schema_a.to_dict() == schema_b.to_dict()
     assert len(schema_a.layer_groups) == 6
     assert len(schema_a.timestep_bands) == 4
     assert len(schema_a.cells) == 24
     assert schema_a.candidate_ranks == DEFAULT_CANDIDATE_RANKS
+    assert actual_groups == EXPECTED_LAYER_GROUPS
+    assert all(group.layer_ids for group in schema_a.layer_groups)
+    assert "mid_block.attentions.1" not in grouped_layer_ids
+    assert "up_blocks.2.attentions.0" not in grouped_layer_ids
+    assert "up_blocks.2.attentions.1" not in grouped_layer_ids
 
 
 def test_candidate_rank_parsing_is_deterministic() -> None:
     assert parse_candidate_ranks_argument("16, 4, 0, 8, 2, 8") == DEFAULT_CANDIDATE_RANKS
     assert parse_candidate_ranks_argument((0, 16, 2, 4, 8, 2)) == DEFAULT_CANDIDATE_RANKS
+
+
+def test_inventory_and_cell_target_validation_match_grouped_blocks() -> None:
+    schema = build_cell_schema()
+    unet = _build_fake_unet()
+
+    inventory = validate_layer_group_inventory(unet)
+    matches_by_cell = validate_cell_targets(schema, unet, DEFAULT_TARGET_MODULES)
+
+    assert set(inventory) == {layer_id for layer_ids in EXPECTED_LAYER_GROUPS.values() for layer_id in layer_ids}
+    assert len(matches_by_cell) == 24
+
+
+def test_cell_target_validation_rejects_empty_group_matches() -> None:
+    schema = build_cell_schema()
+    unet = _build_fake_unet(excluded_blocks=EXPECTED_LAYER_GROUPS["layer_group_05"])
+
+    try:
+        validate_cell_targets(schema, unet, DEFAULT_TARGET_MODULES)
+    except ValueError as exc:
+        assert "layer_group_05__timestep_band_00" in str(exc)
+    else:
+        raise AssertionError("validate_cell_targets should reject cells that match zero UNet modules")
 
 
 def test_probe_output_schema_matches_required_columns_and_keys(tmp_path: Path) -> None:

@@ -9,6 +9,14 @@ DEFAULT_TIMESTEP_BAND_COUNT = 4
 DEFAULT_NUM_INFERENCE_STEPS = 20
 DEFAULT_CANDIDATE_RANKS = (0, 2, 4, 8, 16)
 DEFAULT_TARGET_MODULES = ("to_k", "to_q", "to_v", "to_out.0")
+DEFAULT_LAYER_GROUP_LAYER_IDS = (
+    ("down_blocks.0.attentions.0", "down_blocks.0.attentions.1"),
+    ("down_blocks.1.attentions.0", "down_blocks.1.attentions.1"),
+    ("down_blocks.2.attentions.0", "down_blocks.2.attentions.1"),
+    ("mid_block.attentions.0", "up_blocks.0.attentions.0"),
+    ("up_blocks.0.attentions.1", "up_blocks.0.attentions.2", "up_blocks.1.attentions.0"),
+    ("up_blocks.1.attentions.1", "up_blocks.1.attentions.2"),
+)
 
 
 @dataclass(frozen=True)
@@ -238,22 +246,101 @@ def _partition_sequence(length: int, partition_count: int) -> list[tuple[int, in
     return partitions
 
 
+def _normalize_target_modules(target_modules: Sequence[str]) -> tuple[str, ...]:
+    normalized = tuple(str(target_module).strip() for target_module in target_modules if str(target_module).strip())
+    if not normalized:
+        raise ValueError("target_modules must contain at least one module suffix")
+    return normalized
+
+
+def _enumerate_target_module_names(unet: Any, target_modules: Sequence[str]) -> tuple[str, ...]:
+    suffixes = _normalize_target_modules(target_modules)
+    matched = {
+        module_name
+        for module_name, _module in unet.named_modules()
+        if any(module_name.endswith(f".{suffix}") or module_name == suffix for suffix in suffixes)
+    }
+    return tuple(sorted(matched))
+
+
+def _match_block_module_names(module_names: Sequence[str], layer_ids: Sequence[str]) -> tuple[str, ...]:
+    prefixes = tuple(str(layer_id) for layer_id in layer_ids)
+    return tuple(
+        module_name
+        for module_name in module_names
+        if any(module_name.startswith(f"{prefix}.") or module_name == prefix for prefix in prefixes)
+    )
+
+
 def build_layer_groups(
     layer_catalog: Sequence[LayerSpec],
     *,
     group_count: int = DEFAULT_LAYER_GROUP_COUNT,
 ) -> tuple[LayerGroup, ...]:
+    if group_count != len(DEFAULT_LAYER_GROUP_LAYER_IDS):
+        raise ValueError(
+            f"layer_group_count must remain {len(DEFAULT_LAYER_GROUP_LAYER_IDS)} for the SDXL UNet schema"
+        )
+
     ordered_layers = tuple(sorted(layer_catalog, key=lambda layer: layer.order))
+    layer_lookup = {layer.layer_id: layer for layer in ordered_layers}
     groups: list[LayerGroup] = []
-    for group_index, (start, end) in enumerate(_partition_sequence(len(ordered_layers), group_count)):
+    for group_index, layer_ids in enumerate(DEFAULT_LAYER_GROUP_LAYER_IDS):
+        missing_layer_ids = [layer_id for layer_id in layer_ids if layer_id not in layer_lookup]
+        if missing_layer_ids:
+            raise ValueError(
+                "schema.layer_catalog is missing required layer_ids for "
+                f"layer_group_{group_index:02d}: {missing_layer_ids!r}"
+            )
         groups.append(
             LayerGroup(
                 group_id=f"layer_group_{group_index:02d}",
                 group_index=group_index,
-                layers=ordered_layers[start:end],
+                layers=tuple(layer_lookup[layer_id] for layer_id in layer_ids),
             )
         )
     return tuple(groups)
+
+
+def validate_layer_group_inventory(unet: Any) -> dict[str, tuple[str, ...]]:
+    module_names = _enumerate_target_module_names(unet, DEFAULT_TARGET_MODULES)
+    if not module_names:
+        raise ValueError(f"UNet inventory did not expose any modules for target_modules={DEFAULT_TARGET_MODULES!r}")
+
+    inventory: dict[str, tuple[str, ...]] = {}
+    seen_layer_ids: set[str] = set()
+    for group in build_layer_groups(default_layer_catalog()):
+        if not group.layer_ids:
+            raise ValueError(f"{group.group_id} must not be empty")
+        for layer_id in group.layer_ids:
+            if layer_id in seen_layer_ids:
+                raise ValueError(f"Duplicate layer_id across groups: {layer_id!r}")
+            seen_layer_ids.add(layer_id)
+            matched = _match_block_module_names(module_names, (layer_id,))
+            if not matched:
+                raise ValueError(f"{group.group_id} references block {layer_id!r}, but it does not exist in the UNet")
+            inventory[layer_id] = matched
+    return inventory
+
+
+def validate_cell_targets(
+    schema: CellSchema,
+    unet: Any,
+    target_modules: Sequence[str],
+) -> dict[str, tuple[str, ...]]:
+    module_names = _enumerate_target_module_names(unet, target_modules)
+    if not module_names:
+        raise ValueError(f"UNet inventory did not expose any modules for target_modules={tuple(target_modules)!r}")
+
+    matches_by_cell: dict[str, tuple[str, ...]] = {}
+    for cell in schema.cells:
+        matched = _match_block_module_names(module_names, cell.layer_group.layer_ids)
+        if not matched:
+            raise ValueError(
+                f"Cell {cell.cell_id} did not match any UNet modules for target_modules={tuple(target_modules)!r}"
+            )
+        matches_by_cell[cell.cell_id] = matched
+    return matches_by_cell
 
 
 def build_timestep_bands(
@@ -284,6 +371,8 @@ def build_cell_schema(
     num_inference_steps: int = DEFAULT_NUM_INFERENCE_STEPS,
     timestep_band_count: int = DEFAULT_TIMESTEP_BAND_COUNT,
     candidate_ranks: Sequence[int] | None = None,
+    unet: Any | None = None,
+    target_modules: Sequence[str] = DEFAULT_TARGET_MODULES,
 ) -> CellSchema:
     catalog = tuple(layer_catalog or default_layer_catalog())
     timestep_tuple = resolve_timestep_values(
@@ -320,7 +409,7 @@ def build_cell_schema(
                 for step_index in band.step_indices:
                     cell_lookup[(layer_id, step_index)] = cell
 
-    return CellSchema(
+    schema = CellSchema(
         layer_catalog=catalog,
         layer_groups=groups,
         timestep_bands=bands,
@@ -331,6 +420,10 @@ def build_cell_schema(
         _step_to_band=step_to_band,
         _cell_lookup=cell_lookup,
     )
+    if unet is not None:
+        validate_layer_group_inventory(unet)
+        validate_cell_targets(schema, unet, target_modules)
+    return schema
 
 
 __all__ = [
@@ -352,4 +445,6 @@ __all__ = [
     "resolve_candidate_ranks",
     "resolve_layer_catalog",
     "resolve_timestep_values",
+    "validate_cell_targets",
+    "validate_layer_group_inventory",
 ]

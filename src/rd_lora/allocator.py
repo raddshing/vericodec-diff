@@ -1,52 +1,23 @@
 from __future__ import annotations
-
-import csv
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from rd_lora.probe import DEFAULT_ACCELERATE_CONFIG, run_preflight
-from rd_lora.substrate.diffusers_sdxl import deep_update, display_path, resolve_path, save_json
-from rd_lora.surrogate import (
-    DEFAULT_SURROGATE_FEATURE_NAMES,
-    LinearUtilitySurrogate,
-    fit_linear_surrogate,
-    load_utility_records,
-    score_records,
-    write_metric_csv,
-    write_prediction_csv,
-)
+from rd_lora.cells import CellSchema, DEFAULT_TARGET_MODULES, build_cell_schema
+from rd_lora.runtime.allocation_manifest import load_allocation_manifest as _load_runtime_allocation_manifest
 
 
-DEFAULT_ALLOCATOR_CONFIG_PATH = "configs/rdlora_allocator.yaml"
-DEFAULT_ALLOCATOR_OUTPUT_ROOT = "outputs/rd_lora/allocator"
-ALLOCATION_CHOICE_FIELDNAMES = (
+CANONICAL_SCORED_ROW_FIELDNAMES = (
     "cell_id",
-    "layer_group_id",
-    "timestep_band_id",
+    "layer_group",
+    "timestep_band",
     "candidate_rank",
-    "cost",
     "predicted_utility",
-    "rank_fraction_of_max",
-    "is_attention_cell",
-    "layer_count",
-    "step_count",
-    "event_count",
-)
-ALLOCATION_SUMMARY_FIELDNAMES = (
-    "budget",
-    "used_budget",
-    "budget_utilization",
-    "selected_cell_count",
-    "total_predicted_utility",
-    "solver_mode",
-    "used_fallback",
 )
 
 
 class AllocationValidationError(ValueError):
-    """Raised when the allocator config or outputs are invalid."""
+    """Raised when canonical allocation inputs or outputs are invalid."""
 
 
 @dataclass(frozen=True)
@@ -55,66 +26,6 @@ class _DpState:
     used_budget: int
     signature: tuple[int, ...]
     selections: tuple[dict[str, Any], ...]
-
-
-def default_allocator_config() -> dict[str, Any]:
-    return {
-        "paths": {
-            "repo_root": ".",
-            "probe_run_dir": "outputs/rd_lora/probe/stageb_cpu_smoke",
-            "output_root": DEFAULT_ALLOCATOR_OUTPUT_ROOT,
-            "accelerate_config": DEFAULT_ACCELERATE_CONFIG,
-        },
-        "run": {
-            "name": "stagec_smoke",
-            "seed": 20260409,
-        },
-        "preflight": {
-            "require_torch_cuda": True,
-            "required_diffusers_version": "0.38.0.dev0",
-            "required_accelerate_config": DEFAULT_ACCELERATE_CONFIG,
-        },
-        "surrogate": {
-            "feature_names": list(DEFAULT_SURROGATE_FEATURE_NAMES),
-            "l2_regularization": 1.0e-6,
-            "clip_min_utility": 0.0,
-            "round_digits": 6,
-        },
-        "allocation": {
-            "budget": 96,
-            "cost_field": "candidate_rank",
-            "utility_field": "predicted_utility",
-            "utility_scale": 1000000,
-            "max_exact_state_count": 500000,
-            "fallback_mode": "deterministic_greedy",
-        },
-    }
-
-
-def _validate_repo_local_path(repo_root: Path, path: Path, *, name: str) -> None:
-    try:
-        path.relative_to(repo_root)
-    except ValueError as exc:
-        raise AllocationValidationError(f"{name} must resolve inside repo_root for deterministic paths") from exc
-
-
-def _validate_single_path_token(raw_value: str, *, name: str) -> str:
-    token = raw_value.strip()
-    if not token:
-        raise AllocationValidationError(f"{name} must be a non-empty path token")
-    token_path = Path(token)
-    if len(token_path.parts) != 1 or token_path.name != token or token in {".", ".."}:
-        raise AllocationValidationError(f"{name} must be a single path component")
-    return token
-
-
-def _write_csv(path: Path, records: Sequence[Mapping[str, Any]], *, fieldnames: Sequence[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
-        writer.writeheader()
-        for record in records:
-            writer.writerow({field: record.get(field) for field in fieldnames})
 
 
 def _as_float(value: Any) -> float:
@@ -136,220 +47,131 @@ def _as_non_negative_int(value: Any, *, name: str) -> int:
     return parsed
 
 
-def resolve_allocator_config(repo_root: Path, raw_config: Mapping[str, Any]) -> dict[str, Any]:
-    config = deep_update(default_allocator_config(), raw_config)
-    paths = dict(config.get("paths", {}))
-    run = dict(config.get("run", {}))
-    preflight = dict(config.get("preflight", {}))
-    surrogate = dict(config.get("surrogate", {}))
-    allocation = dict(config.get("allocation", {}))
+def _candidate_ranks_from_records(records: Sequence[Mapping[str, Any]]) -> tuple[int, ...]:
+    candidate_ranks = sorted({int(record["candidate_rank"]) for record in records})
+    if not candidate_ranks:
+        raise AllocationValidationError("At least one candidate rank is required")
+    if candidate_ranks[0] != 0:
+        raise AllocationValidationError("candidate ranks must include rank 0")
+    return tuple(candidate_ranks)
 
-    resolved_repo_root = resolve_path(repo_root, str(paths.get("repo_root", "."))).resolve()
-    probe_run_dir = resolve_path(resolved_repo_root, str(paths.get("probe_run_dir"))).resolve()
-    output_root = resolve_path(
-        resolved_repo_root,
-        str(paths.get("output_root", DEFAULT_ALLOCATOR_OUTPUT_ROOT)),
-    ).resolve()
-    accelerate_config = resolve_path(
-        resolved_repo_root,
-        str(paths.get("accelerate_config", DEFAULT_ACCELERATE_CONFIG)),
-    ).resolve()
-    required_accelerate_config = resolve_path(
-        resolved_repo_root,
-        str(preflight.get("required_accelerate_config", DEFAULT_ACCELERATE_CONFIG)),
-    ).resolve()
 
-    run_name = _validate_single_path_token(str(run.get("name", "stagec_smoke")), name="run.name")
-    run_dir = output_root / run_name
-    surrogate_dir = run_dir / "surrogate"
-    allocation_dir = run_dir / "allocation"
-    utility_records_json = probe_run_dir / "utility_records.json"
-    probe_summary_json = probe_run_dir / "probe_summary.json"
+def build_allocation_schema(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    schema: CellSchema | None = None,
+) -> CellSchema:
+    if schema is not None:
+        return schema
+    return build_cell_schema(candidate_ranks=_candidate_ranks_from_records(records))
 
-    path_map = {
-        "paths.probe_run_dir": probe_run_dir,
-        "paths.output_root": output_root,
-        "derived run_dir": run_dir,
-        "derived surrogate_dir": surrogate_dir,
-        "derived allocation_dir": allocation_dir,
-        "paths.accelerate_config": accelerate_config,
-        "preflight.required_accelerate_config": required_accelerate_config,
-        "derived utility_records_json": utility_records_json,
-        "derived probe_summary_json": probe_summary_json,
-    }
-    for name, path in path_map.items():
-        _validate_repo_local_path(resolved_repo_root, path, name=name)
 
-    feature_names = [str(value) for value in surrogate.get("feature_names", DEFAULT_SURROGATE_FEATURE_NAMES)]
-    if not feature_names:
-        raise AllocationValidationError("surrogate.feature_names must not be empty")
-    l2_regularization = float(surrogate.get("l2_regularization", 1.0e-6))
-    if l2_regularization < 0.0:
-        raise AllocationValidationError("surrogate.l2_regularization must be non-negative")
-    round_digits = int(surrogate.get("round_digits", 6))
-    if round_digits < 0:
-        raise AllocationValidationError("surrogate.round_digits must be non-negative")
+def _resolve_layer_group(row: Mapping[str, Any], schema: CellSchema) -> str:
+    raw_layer_group = row.get("layer_group")
+    if isinstance(raw_layer_group, str):
+        layer_group = raw_layer_group.strip()
+        if not layer_group:
+            raise AllocationValidationError("layer_group must be non-empty when provided as a string")
+        return layer_group
+    try:
+        return schema.layer_groups[int(row["layer_group_id"])].group_id
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise AllocationValidationError("Unable to resolve layer_group from surrogate row") from exc
 
-    budget = _as_non_negative_int(allocation.get("budget", 0), name="allocation.budget")
-    utility_scale = _as_non_negative_int(
-        allocation.get("utility_scale", 1000000),
-        name="allocation.utility_scale",
-    )
-    if utility_scale == 0:
-        raise AllocationValidationError("allocation.utility_scale must be positive")
-    max_exact_state_count = _as_non_negative_int(
-        allocation.get("max_exact_state_count", 500000),
-        name="allocation.max_exact_state_count",
-    )
-    if max_exact_state_count == 0:
-        raise AllocationValidationError("allocation.max_exact_state_count must be positive")
-    fallback_mode = str(allocation.get("fallback_mode", "deterministic_greedy")).strip()
-    if fallback_mode not in {"deterministic_greedy"}:
-        raise AllocationValidationError("allocation.fallback_mode must be 'deterministic_greedy'")
+
+def _resolve_timestep_band(row: Mapping[str, Any], schema: CellSchema) -> str:
+    raw_timestep_band = row.get("timestep_band")
+    if isinstance(raw_timestep_band, str):
+        timestep_band = raw_timestep_band.strip()
+        if not timestep_band:
+            raise AllocationValidationError("timestep_band must be non-empty when provided as a string")
+        return timestep_band
+    try:
+        return schema.timestep_bands[int(row["timestep_band_id"])].band_id
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise AllocationValidationError("Unable to resolve timestep_band from surrogate row") from exc
+
+
+def canonicalize_scored_row(
+    row: Mapping[str, Any],
+    *,
+    schema: CellSchema,
+) -> dict[str, Any]:
+    layer_group = _resolve_layer_group(row, schema)
+    timestep_band = _resolve_timestep_band(row, schema)
+    cell_id = str(row.get("cell_id") or f"{layer_group}__{timestep_band}").strip()
+    candidate_rank = int(row["candidate_rank"])
+    if "predicted_utility" in row:
+        predicted_utility = float(row["predicted_utility"])
+    elif "utility_score" in row:
+        predicted_utility = float(row["utility_score"])
+    else:
+        predicted_utility = float(row["utility"])
+
+    expected_cell_id = f"{layer_group}__{timestep_band}"
+    layer_group_ids = {group.group_id for group in schema.layer_groups}
+    timestep_band_ids = {band.band_id for band in schema.timestep_bands}
+    schema_cell_ids = {cell.cell_id for cell in schema.cells}
+
+    if layer_group not in layer_group_ids:
+        raise AllocationValidationError(f"Unknown layer_group {layer_group!r}")
+    if timestep_band not in timestep_band_ids:
+        raise AllocationValidationError(f"Unknown timestep_band {timestep_band!r}")
+    if candidate_rank not in set(schema.candidate_ranks):
+        raise AllocationValidationError(f"Unknown candidate_rank {candidate_rank!r}")
+    if cell_id != expected_cell_id:
+        raise AllocationValidationError(
+            f"cell_id {cell_id!r} does not match canonical schema id {expected_cell_id!r}"
+        )
+    if cell_id not in schema_cell_ids:
+        raise AllocationValidationError(f"Unknown cell_id {cell_id!r}")
 
     return {
-        "paths": {
-            "repo_root": str(resolved_repo_root),
-            "probe_run_dir": str(probe_run_dir),
-            "probe_summary_json": str(probe_summary_json),
-            "utility_records_json": str(utility_records_json),
-            "output_root": str(output_root),
-            "run_dir": str(run_dir),
-            "surrogate_dir": str(surrogate_dir),
-            "surrogate_model_json": str(surrogate_dir / "surrogate_model.json"),
-            "surrogate_predictions_json": str(surrogate_dir / "surrogate_predictions.json"),
-            "surrogate_predictions_csv": str(surrogate_dir / "surrogate_predictions.csv"),
-            "surrogate_metrics_csv": str(surrogate_dir / "surrogate_metrics.csv"),
-            "surrogate_summary_json": str(surrogate_dir / "surrogate_training_summary.json"),
-            "allocation_dir": str(allocation_dir),
-            "allocation_manifest_json": str(allocation_dir / "allocation_manifest.json"),
-            "allocation_choices_csv": str(allocation_dir / "allocation_choices.csv"),
-            "allocation_summary_csv": str(allocation_dir / "allocation_summary.csv"),
-            "accelerate_config": str(accelerate_config),
-        },
-        "run": {
-            "name": run_name,
-            "seed": int(run.get("seed", 20260409)),
-        },
-        "preflight": {
-            "require_torch_cuda": bool(preflight.get("require_torch_cuda", True)),
-            "required_diffusers_version": preflight.get("required_diffusers_version"),
-            "required_accelerate_config": str(required_accelerate_config),
-        },
-        "surrogate": {
-            "feature_names": feature_names,
-            "l2_regularization": l2_regularization,
-            "clip_min_utility": surrogate.get("clip_min_utility"),
-            "round_digits": round_digits,
-        },
-        "allocation": {
-            "budget": budget,
-            "cost_field": str(allocation.get("cost_field", "candidate_rank")),
-            "utility_field": str(allocation.get("utility_field", "predicted_utility")),
-            "utility_scale": utility_scale,
-            "max_exact_state_count": max_exact_state_count,
-            "fallback_mode": fallback_mode,
-        },
+        "cell_id": cell_id,
+        "layer_group": layer_group,
+        "timestep_band": timestep_band,
+        "candidate_rank": candidate_rank,
+        "predicted_utility": predicted_utility,
     }
 
 
-def train_surrogate_from_config(
-    config: Mapping[str, Any],
+def canonicalize_scored_rows(
+    records: Sequence[Mapping[str, Any]],
     *,
-    resolved_config_path: Path,
-) -> dict[str, Any]:
-    repo_root = Path(config["paths"]["repo_root"])
-    utility_records_path = Path(config["paths"]["utility_records_json"])
-    if not utility_records_path.is_file():
-        raise AllocationValidationError(f"Missing probe utility records JSON: {utility_records_path}")
+    schema: CellSchema | None = None,
+) -> list[dict[str, Any]]:
+    if not records:
+        raise AllocationValidationError("At least one scored surrogate row is required")
 
-    surrogate_dir = Path(config["paths"]["surrogate_dir"])
-    surrogate_dir.mkdir(parents=True, exist_ok=True)
-    preflight = run_preflight(config)
+    resolved_schema = build_allocation_schema(records, schema=schema)
+    cell_order = {cell.cell_id: cell.cell_index for cell in resolved_schema.cells}
+    rank_order = {rank: index for index, rank in enumerate(resolved_schema.candidate_ranks)}
 
-    utility_records = load_utility_records(utility_records_path)
-    fit_result = fit_linear_surrogate(
-        utility_records,
-        feature_names=config["surrogate"]["feature_names"],
-        l2_regularization=float(config["surrogate"]["l2_regularization"]),
-        clip_min_utility=config["surrogate"]["clip_min_utility"],
-        round_digits=int(config["surrogate"]["round_digits"]),
-    )
-    model = fit_result["model"]
-    scored_records = fit_result["records"]
-    metrics = fit_result["metrics"]
-
-    model_json_path = Path(config["paths"]["surrogate_model_json"])
-    predictions_json_path = Path(config["paths"]["surrogate_predictions_json"])
-    predictions_csv_path = Path(config["paths"]["surrogate_predictions_csv"])
-    metrics_csv_path = Path(config["paths"]["surrogate_metrics_csv"])
-    summary_json_path = Path(config["paths"]["surrogate_summary_json"])
-
-    save_json(
-        model_json_path,
-        {
-            **model.to_dict(),
-            "resolved_config": display_path(resolved_config_path, repo_root),
-            "source_probe_summary": display_path(Path(config["paths"]["probe_summary_json"]), repo_root),
-            "source_utility_records": display_path(utility_records_path, repo_root),
-            "record_count": len(scored_records),
-            "metrics": metrics,
-        },
-    )
-    save_json(
-        predictions_json_path,
-        {
-            "schema_version": 1,
-            "resolved_config": display_path(resolved_config_path, repo_root),
-            "source_utility_records": display_path(utility_records_path, repo_root),
-            "feature_names": list(model.feature_names),
-            "record_count": len(scored_records),
-            "records": scored_records,
-        },
-    )
-    write_prediction_csv(predictions_csv_path, scored_records)
-    write_metric_csv(metrics_csv_path, metrics)
-
-    summary_payload = {
-        "schema_version": 1,
-        "resolved_config": display_path(resolved_config_path, repo_root),
-        "source_probe_summary": display_path(Path(config["paths"]["probe_summary_json"]), repo_root),
-        "source_utility_records": display_path(utility_records_path, repo_root),
-        "model_json": display_path(model_json_path, repo_root),
-        "predictions_json": display_path(predictions_json_path, repo_root),
-        "predictions_csv": display_path(predictions_csv_path, repo_root),
-        "metrics_csv": display_path(metrics_csv_path, repo_root),
-        "record_count": len(scored_records),
-        "cell_count": len({str(record["cell_id"]) for record in scored_records}),
-        "preflight": preflight,
-        "metrics": metrics,
-        "completed_successfully": True,
-    }
-    save_json(summary_json_path, summary_payload)
-    summary_payload["summary_json"] = display_path(summary_json_path, repo_root)
-    return summary_payload
-
-
-def load_surrogate_predictions(path: Path) -> list[dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise AllocationValidationError(f"{path} must parse to a mapping")
-    records = payload.get("records")
-    if not isinstance(records, list):
-        raise AllocationValidationError(f"{path} must define a records list")
-    normalized: list[dict[str, Any]] = []
+    canonical_rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
     for record in records:
-        payload_record = dict(record)
-        if "predicted_utility" not in payload_record:
-            raise AllocationValidationError(f"{path} records must include predicted_utility")
-        normalized.append(payload_record)
+        canonical = canonicalize_scored_row(record, schema=resolved_schema)
+        key = (canonical["cell_id"], canonical["candidate_rank"])
+        if key in seen:
+            raise AllocationValidationError(f"Duplicate scored surrogate row for {key!r}")
+        seen.add(key)
+        canonical_rows.append(canonical)
+
+    expected = {
+        (cell.cell_id, int(candidate_rank))
+        for cell in resolved_schema.cells
+        for candidate_rank in resolved_schema.candidate_ranks
+    }
+    missing = sorted(expected - seen)
+    if missing:
+        preview = ", ".join(f"{cell_id}@{rank}" for cell_id, rank in missing[:5])
+        raise AllocationValidationError(f"Missing canonical scored rows for {preview}")
+
     return sorted(
-        normalized,
+        canonical_rows,
         key=lambda item: (
-            str(item["cell_id"]),
-            int(item["candidate_rank"]),
-            str(item["layer_group_id"]),
-            str(item["timestep_band_id"]),
+            cell_order[item["cell_id"]],
+            rank_order[item["candidate_rank"]],
         ),
     )
 
@@ -359,48 +181,56 @@ def build_choice_groups(
     *,
     cost_field: str,
     utility_field: str,
+    schema: CellSchema | None = None,
 ) -> list[dict[str, Any]]:
-    groups: dict[str, dict[str, Any]] = {}
-    for record in records:
-        cell_id = str(record["cell_id"])
-        group = groups.setdefault(
-            cell_id,
-            {
-                "group_id": cell_id,
-                "layer_group_id": str(record["layer_group_id"]),
-                "timestep_band_id": str(record["timestep_band_id"]),
-                "is_attention_cell": bool(record["is_attention_cell"]),
-                "options": [],
-            },
-        )
-        option = dict(record)
-        option["cost"] = _as_non_negative_int(record[cost_field], name=f"{cell_id}.{cost_field}")
-        option["utility"] = _as_float(record[utility_field])
-        group["options"].append(option)
+    if cost_field != "candidate_rank":
+        raise AllocationValidationError("build_choice_groups only supports cost_field='candidate_rank'")
+    if utility_field != "predicted_utility":
+        raise AllocationValidationError("build_choice_groups only supports utility_field='predicted_utility'")
 
-    if not groups:
-        raise AllocationValidationError("At least one allocation group is required")
+    canonical_rows = canonicalize_scored_rows(records, schema=schema)
+    by_cell: dict[str, list[dict[str, Any]]] = {}
+    max_rank = max(int(rank) for rank in build_allocation_schema(records, schema=schema).candidate_ranks)
+    for row in canonical_rows:
+        by_cell.setdefault(str(row["cell_id"]), []).append(dict(row))
 
     choice_groups: list[dict[str, Any]] = []
-    for group_id in sorted(groups):
-        group = groups[group_id]
+    for cell_id in sorted(by_cell):
         options = sorted(
-            group["options"],
+            [
+                {
+                    "cell_id": str(row["cell_id"]),
+                    "layer_group": str(row["layer_group"]),
+                    "layer_group_id": str(row["layer_group"]),
+                    "timestep_band": str(row["timestep_band"]),
+                    "timestep_band_id": str(row["timestep_band"]),
+                    "candidate_rank": int(row["candidate_rank"]),
+                    "cost": int(row["candidate_rank"]),
+                    "utility": float(row["predicted_utility"]),
+                    "rank_fraction_of_max": (
+                        0.0 if max_rank <= 0 else float(row["candidate_rank"]) / float(max_rank)
+                    ),
+                }
+                for row in by_cell[cell_id]
+            ],
             key=lambda item: (
                 int(item["cost"]),
                 -_as_float(item["utility"]),
                 int(item["candidate_rank"]),
             ),
         )
-        candidate_ranks = [int(item["candidate_rank"]) for item in options]
-        if len(candidate_ranks) != len(set(candidate_ranks)):
-            raise AllocationValidationError(f"Allocation group {group_id!r} contains duplicate candidate ranks")
+        if len({int(option["candidate_rank"]) for option in options}) != len(options):
+            raise AllocationValidationError(f"Duplicate candidate ranks for cell {cell_id!r}")
         choice_groups.append(
             {
-                **group,
+                "group_id": cell_id,
+                "layer_group": str(options[0]["layer_group"]),
+                "timestep_band": str(options[0]["timestep_band"]),
                 "options": options,
             }
         )
+    if not choice_groups:
+        raise AllocationValidationError("At least one allocation choice group is required")
     return choice_groups
 
 
@@ -416,7 +246,6 @@ def _state_is_better(candidate: _DpState, incumbent: _DpState | None) -> bool:
 
 def _build_result(
     *,
-    choice_groups: Sequence[Mapping[str, Any]],
     final_state: _DpState,
     budget: int,
     utility_scale: int,
@@ -425,23 +254,25 @@ def _build_result(
     estimated_state_count: int,
 ) -> dict[str, Any]:
     selections: list[dict[str, Any]] = []
-    for group, selection in zip(choice_groups, final_state.selections):
-        selections.append(
-            {
-                "cell_id": str(selection["cell_id"]),
-                "layer_group_id": str(selection["layer_group_id"]),
-                "timestep_band_id": str(selection["timestep_band_id"]),
-                "candidate_rank": int(selection["candidate_rank"]),
-                "cost": int(selection["cost"]),
-                "predicted_utility": _round_float(_as_float(selection["utility"])),
-                "rank_fraction_of_max": _round_float(_as_float(selection["rank_fraction_of_max"])),
-                "is_attention_cell": bool(group["is_attention_cell"]),
-                "layer_count": int(selection["layer_count"]),
-                "step_count": int(selection["step_count"]),
-                "event_count": int(selection["event_count"]),
-            }
-        )
-    total_predicted_utility = _round_float(final_state.utility_scaled / float(utility_scale))
+    for selection in final_state.selections:
+        layer_group = str(selection.get("layer_group", selection.get("layer_group_id", ""))).strip()
+        timestep_band = str(selection.get("timestep_band", selection.get("timestep_band_id", ""))).strip()
+        payload = {
+            "cell_id": str(selection["cell_id"]),
+            "candidate_rank": int(selection["candidate_rank"]),
+            "cost": int(selection["cost"]),
+            "predicted_utility": _round_float(_as_float(selection["utility"])),
+        }
+        if layer_group:
+            payload["layer_group"] = layer_group
+            payload["layer_group_id"] = layer_group
+        if timestep_band:
+            payload["timestep_band"] = timestep_band
+            payload["timestep_band_id"] = timestep_band
+        if "rank_fraction_of_max" in selection:
+            payload["rank_fraction_of_max"] = _round_float(_as_float(selection["rank_fraction_of_max"]))
+        selections.append(payload)
+
     return {
         "solver_mode": solver_mode,
         "used_fallback": used_fallback,
@@ -449,8 +280,8 @@ def _build_result(
         "used_budget": int(final_state.used_budget),
         "budget_utilization": (_round_float(final_state.used_budget / float(budget)) if budget > 0 else 0.0),
         "selected_cell_count": len(selections),
-        "total_predicted_utility": total_predicted_utility,
-        "estimated_state_count": estimated_state_count,
+        "total_predicted_utility": _round_float(final_state.utility_scaled / float(utility_scale)),
+        "estimated_state_count": int(estimated_state_count),
         "selections": selections,
     }
 
@@ -466,16 +297,18 @@ def solve_multiple_choice_knapsack_exact(
         0: _DpState(utility_scaled=0, used_budget=0, signature=tuple(), selections=tuple())
     }
     for group in choice_groups:
+        options = list(group.get("options", []))
+        if not options:
+            raise AllocationValidationError(f"Choice group {group.get('group_id')!r} must define at least one option")
         next_states: dict[int, _DpState] = {}
         for state in states.values():
-            for option in group["options"]:
+            for option in options:
                 cost = int(option["cost"])
                 new_budget = state.used_budget + cost
                 if new_budget > budget:
                     continue
-                utility_scaled = int(round(_as_float(option["utility"]) * utility_scale))
                 candidate_state = _DpState(
-                    utility_scaled=state.utility_scaled + utility_scaled,
+                    utility_scaled=state.utility_scaled + int(round(_as_float(option["utility"]) * utility_scale)),
                     used_budget=new_budget,
                     signature=state.signature + (int(option["candidate_rank"]),),
                     selections=state.selections + (dict(option),),
@@ -494,7 +327,6 @@ def solve_multiple_choice_knapsack_exact(
     if final_state is None:
         raise AllocationValidationError("Unable to construct an exact allocation result")
     return _build_result(
-        choice_groups=choice_groups,
         final_state=final_state,
         budget=budget,
         utility_scale=utility_scale,
@@ -514,25 +346,32 @@ def solve_multiple_choice_knapsack_greedy(
     current_indices: list[int] = []
     current_budget = 0
     current_utility = 0.0
+
     for group in choice_groups:
+        options = list(group.get("options", []))
+        if not options:
+            raise AllocationValidationError(f"Choice group {group.get('group_id')!r} must define at least one option")
         baseline = min(
-            group["options"],
+            options,
             key=lambda item: (
                 int(item["cost"]),
                 -_as_float(item["utility"]),
                 int(item["candidate_rank"]),
             ),
         )
-        baseline_index = group["options"].index(baseline)
+        baseline_index = options.index(baseline)
         current_indices.append(baseline_index)
         current_budget += int(baseline["cost"])
         current_utility += _as_float(baseline["utility"])
+
     if current_budget > budget:
         raise AllocationValidationError("Requested budget is smaller than the minimum feasible allocation cost")
 
     while True:
         remaining_budget = budget - current_budget
         best_upgrade: tuple[float, float, int, str, int, int] | None = None
+        best_group_index = -1
+        best_candidate_index = -1
         for group_index, group in enumerate(choice_groups):
             current_option = group["options"][current_indices[group_index]]
             for candidate_index, candidate_option in enumerate(group["options"]):
@@ -542,9 +381,8 @@ def solve_multiple_choice_knapsack_greedy(
                 gain = _as_float(candidate_option["utility"]) - _as_float(current_option["utility"])
                 if gain <= 0.0:
                     continue
-                ratio = gain / float(extra_cost)
                 candidate_key = (
-                    ratio,
+                    gain / float(extra_cost),
                     gain,
                     -extra_cost,
                     str(group["group_id"]),
@@ -575,7 +413,6 @@ def solve_multiple_choice_knapsack_greedy(
         selections=final_selections,
     )
     return _build_result(
-        choice_groups=choice_groups,
         final_state=final_state,
         budget=budget,
         utility_scale=utility_scale,
@@ -593,6 +430,8 @@ def solve_multiple_choice_knapsack(
     max_exact_state_count: int = 500000,
     fallback_mode: str = "deterministic_greedy",
 ) -> dict[str, Any]:
+    if not choice_groups:
+        raise AllocationValidationError("At least one allocation choice group is required")
     normalized_budget = _as_non_negative_int(budget, name="budget")
     estimated_state_count = max(len(choice_groups), 1) * max(normalized_budget + 1, 1)
     estimated_state_count *= max((len(group["options"]) for group in choice_groups), default=1)
@@ -613,160 +452,209 @@ def solve_multiple_choice_knapsack(
     )
 
 
-def solve_allocation_from_config(
-    config: Mapping[str, Any],
+def _choice_groups_for_dimension(
+    canonical_rows: Sequence[Mapping[str, Any]],
     *,
-    resolved_config_path: Path,
-) -> dict[str, Any]:
-    repo_root = Path(config["paths"]["repo_root"])
-    preflight = run_preflight(config)
-    predictions_json_path = Path(config["paths"]["surrogate_predictions_json"])
-    if not predictions_json_path.is_file():
-        model_json_path = Path(config["paths"]["surrogate_model_json"])
-        utility_records_json = Path(config["paths"]["utility_records_json"])
-        if not utility_records_json.is_file():
-            raise AllocationValidationError(
-                f"Missing surrogate predictions {predictions_json_path} and utility records {utility_records_json}"
+    schema: CellSchema,
+    group_field: str,
+    group_ids: Sequence[str],
+    cost_multiplier: int,
+) -> list[dict[str, Any]]:
+    rows_by_group_rank: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    max_rank = max(int(rank) for rank in schema.candidate_ranks)
+    for row in canonical_rows:
+        key = (str(row[group_field]), int(row["candidate_rank"]))
+        rows_by_group_rank.setdefault(key, []).append(dict(row))
+
+    choice_groups: list[dict[str, Any]] = []
+    for group_id in group_ids:
+        options: list[dict[str, Any]] = []
+        for candidate_rank in schema.candidate_ranks:
+            matching = rows_by_group_rank.get((str(group_id), int(candidate_rank)), [])
+            if not matching:
+                raise AllocationValidationError(
+                    f"Missing canonical scored rows for {group_field}={group_id!r} rank={candidate_rank}"
+                )
+            options.append(
+                {
+                    "cell_id": str(group_id),
+                    "candidate_rank": int(candidate_rank),
+                    "cost": int(candidate_rank) * int(cost_multiplier),
+                    "utility": _round_float(
+                        sum(float(item["predicted_utility"]) for item in matching)
+                    ),
+                    "rank_fraction_of_max": (
+                        0.0 if max_rank <= 0 else float(candidate_rank) / float(max_rank)
+                    ),
+                }
             )
-        if not model_json_path.is_file():
-            raise AllocationValidationError(f"Missing surrogate model JSON: {model_json_path}")
-        model_payload = json.loads(model_json_path.read_text(encoding="utf-8"))
-        model = LinearUtilitySurrogate.from_dict(model_payload)
-        utility_records = load_utility_records(utility_records_json)
-        scored_records = score_records(model, utility_records)
-        save_json(
-            predictions_json_path,
-            {
-                "schema_version": 1,
-                "resolved_config": display_path(resolved_config_path, repo_root),
-                "source_utility_records": display_path(utility_records_json, repo_root),
-                "feature_names": list(model.feature_names),
-                "record_count": len(scored_records),
-                "records": scored_records,
-            },
-        )
-        write_prediction_csv(Path(config["paths"]["surrogate_predictions_csv"]), scored_records)
+        choice_groups.append({"group_id": str(group_id), "options": options})
+    return choice_groups
 
-    prediction_records = load_surrogate_predictions(predictions_json_path)
-    choice_groups = build_choice_groups(
-        prediction_records,
-        cost_field=str(config["allocation"]["cost_field"]),
-        utility_field=str(config["allocation"]["utility_field"]),
-    )
+
+def _solve_uniform(
+    canonical_rows: Sequence[Mapping[str, Any]],
+    *,
+    schema: CellSchema,
+    rank_budget_total: int,
+) -> dict[str, int]:
+    utility_by_rank = {int(candidate_rank): 0.0 for candidate_rank in schema.candidate_ranks}
+    for row in canonical_rows:
+        utility_by_rank[int(row["candidate_rank"])] += float(row["predicted_utility"])
+
+    best_rank = 0
+    best_utility = float("-inf")
+    for candidate_rank in schema.candidate_ranks:
+        used_budget = int(candidate_rank) * len(schema.cells)
+        if used_budget > rank_budget_total:
+            continue
+        candidate_utility = _round_float(utility_by_rank[int(candidate_rank)])
+        if candidate_utility > best_utility or (
+            candidate_utility == best_utility and int(candidate_rank) < best_rank
+        ):
+            best_rank = int(candidate_rank)
+            best_utility = candidate_utility
+    return {cell.cell_id: int(best_rank) for cell in schema.cells}
+
+
+def _solve_layer_only(
+    canonical_rows: Sequence[Mapping[str, Any]],
+    *,
+    schema: CellSchema,
+    rank_budget_total: int,
+    utility_scale: int = 1000000,
+    max_exact_state_count: int = 500000,
+    fallback_mode: str = "deterministic_greedy",
+) -> dict[str, int]:
     result = solve_multiple_choice_knapsack(
-        choice_groups,
-        budget=int(config["allocation"]["budget"]),
-        utility_scale=int(config["allocation"]["utility_scale"]),
-        max_exact_state_count=int(config["allocation"]["max_exact_state_count"]),
-        fallback_mode=str(config["allocation"]["fallback_mode"]),
+        _choice_groups_for_dimension(
+            canonical_rows,
+            schema=schema,
+            group_field="layer_group",
+            group_ids=[group.group_id for group in schema.layer_groups],
+            cost_multiplier=len(schema.timestep_bands),
+        ),
+        budget=rank_budget_total,
+        utility_scale=utility_scale,
+        max_exact_state_count=max_exact_state_count,
+        fallback_mode=fallback_mode,
     )
+    rank_by_group = {str(item["cell_id"]): int(item["candidate_rank"]) for item in result["selections"]}
+    return {cell.cell_id: rank_by_group[cell.layer_group.group_id] for cell in schema.cells}
 
-    allocation_dir = Path(config["paths"]["allocation_dir"])
-    allocation_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = Path(config["paths"]["allocation_manifest_json"])
-    choices_csv_path = Path(config["paths"]["allocation_choices_csv"])
-    summary_csv_path = Path(config["paths"]["allocation_summary_csv"])
 
-    manifest = {
-        "schema_version": 1,
-        "resolved_config": display_path(resolved_config_path, repo_root),
-        "source_probe_run_dir": display_path(Path(config["paths"]["probe_run_dir"]), repo_root),
-        "source_surrogate_predictions": display_path(predictions_json_path, repo_root),
-        "preflight": preflight,
-        "budget": {
-            "available": int(result["budget"]),
-            "used": int(result["used_budget"]),
-            "utilization": result["budget_utilization"],
-        },
-        "solver": {
-            "mode": result["solver_mode"],
-            "used_fallback": bool(result["used_fallback"]),
-            "estimated_state_count": int(result["estimated_state_count"]),
-        },
-        "totals": {
-            "selected_cell_count": int(result["selected_cell_count"]),
-            "total_predicted_utility": result["total_predicted_utility"],
-        },
-        "selections": result["selections"],
-    }
-    save_json(manifest_path, manifest)
-    _write_csv(choices_csv_path, result["selections"], fieldnames=ALLOCATION_CHOICE_FIELDNAMES)
-    _write_csv(
-        summary_csv_path,
-        [
+def _solve_timestep_only(
+    canonical_rows: Sequence[Mapping[str, Any]],
+    *,
+    schema: CellSchema,
+    rank_budget_total: int,
+    utility_scale: int = 1000000,
+    max_exact_state_count: int = 500000,
+    fallback_mode: str = "deterministic_greedy",
+) -> dict[str, int]:
+    result = solve_multiple_choice_knapsack(
+        _choice_groups_for_dimension(
+            canonical_rows,
+            schema=schema,
+            group_field="timestep_band",
+            group_ids=[band.band_id for band in schema.timestep_bands],
+            cost_multiplier=len(schema.layer_groups),
+        ),
+        budget=rank_budget_total,
+        utility_scale=utility_scale,
+        max_exact_state_count=max_exact_state_count,
+        fallback_mode=fallback_mode,
+    )
+    rank_by_band = {str(item["cell_id"]): int(item["candidate_rank"]) for item in result["selections"]}
+    return {cell.cell_id: rank_by_band[cell.timestep_band.band_id] for cell in schema.cells}
+
+
+def _solve_proposed(
+    canonical_rows: Sequence[Mapping[str, Any]],
+    *,
+    schema: CellSchema,
+    rank_budget_total: int,
+    utility_scale: int = 1000000,
+    max_exact_state_count: int = 500000,
+    fallback_mode: str = "deterministic_greedy",
+) -> dict[str, int]:
+    result = solve_multiple_choice_knapsack(
+        build_choice_groups(
+            canonical_rows,
+            cost_field="candidate_rank",
+            utility_field="predicted_utility",
+            schema=schema,
+        ),
+        budget=rank_budget_total,
+        utility_scale=utility_scale,
+        max_exact_state_count=max_exact_state_count,
+        fallback_mode=fallback_mode,
+    )
+    return {str(item["cell_id"]): int(item["candidate_rank"]) for item in result["selections"]}
+
+
+def build_allocation_manifest(
+    backend: str,
+    *,
+    schema: CellSchema,
+    rank_budget_total: int,
+    cell_ranks: Mapping[str, int],
+    target_modules: Sequence[str] = DEFAULT_TARGET_MODULES,
+) -> dict[str, Any]:
+    if backend not in {"uniform", "layer_only", "timestep_only", "proposed"}:
+        raise AllocationValidationError(f"Unsupported backend {backend!r}")
+
+    cells: list[dict[str, Any]] = []
+    for cell in schema.cells:
+        if cell.cell_id not in cell_ranks:
+            raise AllocationValidationError(f"Missing cell rank for {cell.cell_id!r}")
+        rank = int(cell_ranks[cell.cell_id])
+        adapter_name = (
+            f"{backend}_bank"
+            if backend in {"uniform", "layer_only"}
+            else f"{backend}__{cell.timestep_band.band_id}"
+        )
+        cells.append(
             {
-                "budget": int(result["budget"]),
-                "used_budget": int(result["used_budget"]),
-                "budget_utilization": result["budget_utilization"],
-                "selected_cell_count": int(result["selected_cell_count"]),
-                "total_predicted_utility": result["total_predicted_utility"],
-                "solver_mode": result["solver_mode"],
-                "used_fallback": int(bool(result["used_fallback"])),
+                "cell_id": cell.cell_id,
+                "layer_group": cell.layer_group.group_id,
+                "timestep_band": cell.timestep_band.band_id,
+                "rank": rank,
+                "alpha": rank,
+                "target_modules": [str(module_name) for module_name in target_modules],
+                "adapter_name": adapter_name,
             }
-        ],
-        fieldnames=ALLOCATION_SUMMARY_FIELDNAMES,
-    )
-    validate_allocation_manifest(manifest_path)
+        )
+
     return {
-        "manifest_path": display_path(manifest_path, repo_root),
-        "choices_csv_path": display_path(choices_csv_path, repo_root),
-        "summary_csv_path": display_path(summary_csv_path, repo_root),
-        "budget": manifest["budget"],
-        "solver": manifest["solver"],
-        "totals": manifest["totals"],
-        "selections": manifest["selections"],
-        "preflight": preflight,
+        "schema_version": "1.0",
+        "backend": backend,
+        "rank_budget_total": int(rank_budget_total),
+        "layer_groups": [group.group_id for group in schema.layer_groups],
+        "timestep_bands": [band.band_id for band in schema.timestep_bands],
+        "cells": cells,
     }
 
 
 def validate_allocation_manifest(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise AllocationValidationError(f"{path} must parse to a mapping")
-    required_keys = {
-        "schema_version",
-        "resolved_config",
-        "source_probe_run_dir",
-        "source_surrogate_predictions",
-        "preflight",
-        "budget",
-        "solver",
-        "totals",
-        "selections",
-    }
-    missing = sorted(required_keys - set(payload))
-    if missing:
-        raise AllocationValidationError(f"{path} is missing keys: {missing}")
-    selections = payload["selections"]
-    if not isinstance(selections, list) or not selections:
-        raise AllocationValidationError("allocation manifest must contain a non-empty selections list")
-    used_budget = sum(int(selection["cost"]) for selection in selections)
-    total_utility = _round_float(sum(_as_float(selection["predicted_utility"]) for selection in selections))
-    if used_budget != int(payload["budget"]["used"]):
-        raise AllocationValidationError("allocation manifest budget.used does not match the selected costs")
-    if used_budget > int(payload["budget"]["available"]):
-        raise AllocationValidationError("allocation manifest exceeds the available budget")
-    if total_utility != _round_float(_as_float(payload["totals"]["total_predicted_utility"])):
-        raise AllocationValidationError("allocation manifest total_predicted_utility does not match selections")
+    payload = _load_runtime_allocation_manifest(path)
     return {
         "ok": True,
-        "selected_cell_count": len(selections),
-        "used_budget": used_budget,
-        "total_predicted_utility": total_utility,
+        "selected_cell_count": len(payload["cells"]),
+        "used_budget": sum(int(cell["rank"]) for cell in payload["cells"]),
     }
 
 
 __all__ = [
-    "ALLOCATION_CHOICE_FIELDNAMES",
-    "ALLOCATION_SUMMARY_FIELDNAMES",
-    "DEFAULT_ALLOCATOR_CONFIG_PATH",
+    "CANONICAL_SCORED_ROW_FIELDNAMES",
     "AllocationValidationError",
+    "build_allocation_manifest",
+    "build_allocation_schema",
     "build_choice_groups",
-    "default_allocator_config",
-    "resolve_allocator_config",
-    "solve_allocation_from_config",
+    "canonicalize_scored_row",
+    "canonicalize_scored_rows",
     "solve_multiple_choice_knapsack",
     "solve_multiple_choice_knapsack_exact",
-    "train_surrogate_from_config",
+    "solve_multiple_choice_knapsack_greedy",
     "validate_allocation_manifest",
 ]

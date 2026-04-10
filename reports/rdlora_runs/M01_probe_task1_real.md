@@ -1,7 +1,7 @@
 # M01 probe task1 real
 
-validated_at_utc: 2026-04-10T07:26:40Z
-git_head_before_commit: ab744bab8a236200b671c76af0e67e2bf338e136
+validated_at_utc: 2026-04-10T07:28:30Z
+git_head_before_commit: 30cd0c7b4407ebb31e044f08349e18dc757ae444
 run_dir: outputs/rd_lora/probe/task1_real
 artifacts:
 - outputs/run_provenance/D1_probe_task1_preflight.json

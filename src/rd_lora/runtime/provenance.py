@@ -239,6 +239,14 @@ def assert_real_gpu_provenance(
     return normalized
 
 
+def assert_real_gpu_training_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return assert_real_gpu_provenance(
+        payload,
+        require_gpu=True,
+        forbid_mock=False,
+    )
+
+
 def write_run_provenance(
     *,
     run_dir: str | Path,
@@ -294,6 +302,7 @@ __all__ = [
     "PROVENANCE_SCHEMA_VERSION",
     "ProvenanceError",
     "assert_real_gpu_provenance",
+    "assert_real_gpu_training_provenance",
     "collect_runtime_metadata",
     "iter_recorded_source_paths",
     "load_run_provenance",

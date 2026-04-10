@@ -101,6 +101,76 @@ def resolve_active_adapter_name(
     return adapter_name
 
 
+def project_training_timestep_to_step_index(
+    timestep_value: int,
+    *,
+    num_train_timesteps: int,
+    reference_step_count: int,
+) -> int:
+    if num_train_timesteps <= 0:
+        raise TimestepRoutingError("num_train_timesteps must be positive")
+    if reference_step_count <= 0:
+        raise TimestepRoutingError("reference_step_count must be positive")
+
+    timestep = int(timestep_value)
+    max_timestep = max(1, int(num_train_timesteps) - 1)
+    if timestep < 0 or timestep > max_timestep:
+        raise TimestepRoutingError(
+            f"timestep_value={timestep} must be in [0, {max_timestep}]"
+        )
+
+    progress = float(max_timestep - timestep) / float(max_timestep)
+    projected = int(round(progress * float(reference_step_count - 1)))
+    return max(0, min(reference_step_count - 1, projected))
+
+
+def resolve_timestep_band_name_for_training_timesteps(
+    routing_table: Mapping[str, Mapping[str, Sequence[int] | str]],
+    *,
+    timesteps: Sequence[int],
+    num_train_timesteps: int,
+    reference_step_count: int = 20,
+) -> str:
+    if not timesteps:
+        raise TimestepRoutingError("timesteps must not be empty")
+
+    matches = {
+        resolve_timestep_band_name(
+            routing_table,
+            step_index=project_training_timestep_to_step_index(
+                int(timestep_value),
+                num_train_timesteps=num_train_timesteps,
+                reference_step_count=reference_step_count,
+            ),
+        )
+        for timestep_value in timesteps
+    }
+    if len(matches) != 1:
+        raise TimestepRoutingError(
+            f"timesteps mapped to multiple bands: {sorted(matches)}"
+        )
+    return next(iter(matches))
+
+
+def resolve_active_adapter_name_for_training_timesteps(
+    routing_table: Mapping[str, Mapping[str, Sequence[int] | str]],
+    *,
+    timesteps: Sequence[int],
+    num_train_timesteps: int,
+    reference_step_count: int = 20,
+) -> str:
+    band_name = resolve_timestep_band_name_for_training_timesteps(
+        routing_table,
+        timesteps=timesteps,
+        num_train_timesteps=num_train_timesteps,
+        reference_step_count=reference_step_count,
+    )
+    adapter_name = str(routing_table[band_name].get("adapter_name", "")).strip()
+    if not adapter_name:
+        raise TimestepRoutingError(f"Routing entry for {band_name!r} is missing adapter_name")
+    return adapter_name
+
+
 def describe_routing_table(routing_table: Mapping[str, Mapping[str, Sequence[int] | str]]) -> dict[str, Any]:
     return {
         "timestep_bands": list(routing_table),
@@ -117,6 +187,9 @@ __all__ = [
     "build_adapter_routing_table",
     "build_timestep_band_routes",
     "describe_routing_table",
+    "project_training_timestep_to_step_index",
+    "resolve_active_adapter_name_for_training_timesteps",
     "resolve_active_adapter_name",
     "resolve_timestep_band_name",
+    "resolve_timestep_band_name_for_training_timesteps",
 ]

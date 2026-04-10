@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from rd_lora.cells import CellSchema, build_cell_schema
+from rd_lora.cells import CellSchema, build_cell_schema, validate_cell_targets
 from rd_lora.runtime.allocation_manifest import load_allocation_manifest, validate_allocation_manifest
 from rd_lora.training.timestep_routing import (
     build_adapter_routing_table,
@@ -514,9 +515,98 @@ def build_backend_plan(
         "layer_groups": layer_groups,
         "timestep_bands": timestep_bands,
         "cell_ids": ordered_cell_ids,
+        "cell_configs": {
+            cell_id: dict(cells_by_id[cell_id])
+            for cell_id in ordered_cell_ids
+        },
         "adapter_banks": adapter_banks,
         "routing": routing,
     }
+
+
+def _mode_int(values: Sequence[int], *, context: str) -> int:
+    normalized = [int(value) for value in values]
+    if not normalized:
+        raise AdapterFactoryError(f"{context} must not be empty")
+    return int(Counter(normalized).most_common(1)[0][0])
+
+
+def build_concrete_adapter_specs(
+    plan: Mapping[str, Any],
+    *,
+    unet: Any,
+) -> list[dict[str, Any]]:
+    schema = build_cell_schema(target_modules=plan["target_modules"])
+    matches_by_cell = validate_cell_targets(schema, unet, plan["target_modules"])
+    cell_configs = {
+        str(cell_id): dict(cell)
+        for cell_id, cell in dict(plan["cell_configs"]).items()
+    }
+
+    concrete_specs: list[dict[str, Any]] = []
+    for bank in plan["adapter_banks"]:
+        rank_by_module: dict[str, int] = {}
+        alpha_by_module: dict[str, int] = {}
+        for cell_id in bank["cell_ids"]:
+            cell = cell_configs[str(cell_id)]
+            for module_name in matches_by_cell[str(cell_id)]:
+                rank_by_module[module_name] = int(cell["rank"])
+                alpha_by_module[module_name] = int(cell["alpha"])
+
+        positive_modules = sorted(
+            module_name
+            for module_name, rank in rank_by_module.items()
+            if int(rank) > 0
+        )
+        if not positive_modules:
+            concrete_specs.append(
+                {
+                    "adapter_name": str(bank["adapter_name"]),
+                    "timestep_band": bank["timestep_band"],
+                    "cell_ids": list(bank["cell_ids"]),
+                    "target_modules": [],
+                    "rank": 0,
+                    "alpha": 0,
+                    "rank_pattern": {},
+                    "alpha_pattern": {},
+                    "noop": True,
+                }
+            )
+            continue
+
+        rank = _mode_int(
+            [rank_by_module[module_name] for module_name in positive_modules],
+            context=f"{bank['adapter_name']} rank values",
+        )
+        alpha = _mode_int(
+            [alpha_by_module[module_name] for module_name in positive_modules],
+            context=f"{bank['adapter_name']} alpha values",
+        )
+        rank_pattern = {
+            module_name: int(rank_by_module[module_name])
+            for module_name in positive_modules
+            if int(rank_by_module[module_name]) != rank
+        }
+        alpha_pattern = {
+            module_name: int(alpha_by_module[module_name])
+            for module_name in positive_modules
+            if int(alpha_by_module[module_name]) != alpha
+        }
+        concrete_specs.append(
+            {
+                "adapter_name": str(bank["adapter_name"]),
+                "timestep_band": bank["timestep_band"],
+                "cell_ids": list(bank["cell_ids"]),
+                "target_modules": positive_modules,
+                "rank": rank,
+                "alpha": alpha,
+                "rank_pattern": rank_pattern,
+                "alpha_pattern": alpha_pattern,
+                "noop": False,
+            }
+        )
+
+    return concrete_specs
 
 
 def build_backend_adapter_plan(
@@ -566,6 +656,7 @@ __all__ = [
     "REQUIRED_PROBE_SUMMARY_KEYS",
     "REQUIRED_SURROGATE_SUMMARY_KEYS",
     "build_backend_adapter_plan",
+    "build_concrete_adapter_specs",
     "build_backend_plan",
     "load_actual_contract_binding",
     "write_adapter_plan",

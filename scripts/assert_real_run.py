@@ -17,6 +17,7 @@ from rd_lora.runtime.provenance import (
     load_run_provenance,
     path_contains_forbidden_token,
 )
+from rd_lora.training.execution import validate_training_output_artifacts
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +30,11 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Repeatable relative path that must exist under run_dir.",
+    )
+    parser.add_argument(
+        "--require-training-success",
+        action="store_true",
+        help="Require the full training success artifact contract.",
     )
     return parser.parse_args()
 
@@ -46,6 +52,8 @@ def main() -> int:
         required_path = run_dir / relative_path
         if not required_path.exists():
             raise FileNotFoundError(f"Required file missing: {required_path}")
+    if args.require_training_success:
+        validate_training_output_artifacts(run_dir)
     if args.forbid_mock:
         if path_contains_forbidden_token(run_dir, FORBIDDEN_SOURCE_TOKENS):
             raise RuntimeError(f"Forbidden mock/smoke token found in run_dir: {run_dir}")

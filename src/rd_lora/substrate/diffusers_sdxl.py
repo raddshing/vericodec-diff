@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib.util
 import json
 import shlex
 import shutil
@@ -16,6 +17,9 @@ from PIL import Image, ImageOps
 DEFAULT_IMAGE_SIZE = 1024
 DEFAULT_OFFICIAL_DIFFUSERS_SCRIPT = (
     "baselines/external/huggingface_diffusers/examples/text_to_image/train_text_to_image_lora_sdxl.py"
+)
+DEFAULT_OFFICIAL_DREAMBOOTH_LORA_SCRIPT = (
+    "baselines/external/huggingface_diffusers/examples/dreambooth/train_dreambooth_lora_sdxl.py"
 )
 DEFAULT_TASKS_CONFIG = "configs/rdlora_tasks.yaml"
 PILOT_MANIFEST_COLUMNS = (
@@ -36,6 +40,131 @@ class PilotTaskValidationError(ValueError):
 
 class DiffusersHarnessValidationError(ValueError):
     """Raised when the diffusers SDXL LoRA launch plan is invalid."""
+
+
+class DiffusersExecutionError(RuntimeError):
+    """Raised when the local DreamBooth SDXL execution substrate is unavailable or invalid."""
+
+
+def validate_official_sdxl_dreambooth_script(
+    repo_root: Path,
+    raw_path: str | Path | None = None,
+) -> Path:
+    script_path = resolve_path(
+        repo_root,
+        raw_path or DEFAULT_OFFICIAL_DREAMBOOTH_LORA_SCRIPT,
+    ).resolve()
+    if not script_path.is_file():
+        raise DiffusersExecutionError(f"Official SDXL DreamBooth LoRA script not found: {script_path}")
+    return script_path
+
+
+def load_official_sdxl_dreambooth_module(script_path: str | Path) -> Any:
+    path = Path(script_path).expanduser().resolve()
+    if not path.is_file():
+        raise DiffusersExecutionError(f"Official SDXL DreamBooth LoRA script not found: {path}")
+    spec = importlib.util.spec_from_file_location("rd_lora_official_dreambooth_sdxl", path)
+    if spec is None or spec.loader is None:
+        raise DiffusersExecutionError(f"Unable to load module spec from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_official_sdxl_components(
+    *,
+    pretrained_model_name_or_path: str,
+    revision: str | None,
+    variant: str | None,
+    pretrained_vae_model_name_or_path: str | None,
+    script_path: str | Path,
+) -> dict[str, Any]:
+    module = load_official_sdxl_dreambooth_module(script_path)
+
+    tokenizer = module.AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path,
+        subfolder="tokenizer",
+        revision=revision,
+        use_fast=False,
+    )
+    tokenizer_2 = module.AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path,
+        subfolder="tokenizer_2",
+        revision=revision,
+        use_fast=False,
+    )
+    text_encoder_cls = module.import_model_class_from_model_name_or_path(
+        pretrained_model_name_or_path,
+        revision,
+    )
+    text_encoder_cls_2 = module.import_model_class_from_model_name_or_path(
+        pretrained_model_name_or_path,
+        revision,
+        subfolder="text_encoder_2",
+    )
+    scheduler_type = module.determine_scheduler_type(pretrained_model_name_or_path, revision)
+    if "EDM" in scheduler_type:
+        scheduler = module.EDMEulerScheduler.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="scheduler",
+        )
+    else:
+        scheduler = module.DDPMScheduler.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="scheduler",
+        )
+
+    text_encoder = text_encoder_cls.from_pretrained(
+        pretrained_model_name_or_path,
+        subfolder="text_encoder",
+        revision=revision,
+        variant=variant,
+    )
+    text_encoder_2 = text_encoder_cls_2.from_pretrained(
+        pretrained_model_name_or_path,
+        subfolder="text_encoder_2",
+        revision=revision,
+        variant=variant,
+    )
+    vae_source = pretrained_model_name_or_path if pretrained_vae_model_name_or_path in (None, "") else str(
+        pretrained_vae_model_name_or_path
+    )
+    vae = module.AutoencoderKL.from_pretrained(
+        vae_source,
+        subfolder="vae" if pretrained_vae_model_name_or_path in (None, "") else None,
+        revision=revision,
+        variant=variant,
+    )
+    unet = module.UNet2DConditionModel.from_pretrained(
+        pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=revision,
+        variant=variant,
+    )
+    return {
+        "module": module,
+        "tokenizer": tokenizer,
+        "tokenizer_2": tokenizer_2,
+        "text_encoder": text_encoder,
+        "text_encoder_2": text_encoder_2,
+        "vae": vae,
+        "unet": unet,
+        "scheduler": scheduler,
+        "scheduler_type": scheduler_type,
+    }
+
+
+def describe_loaded_sdxl_components(components: Mapping[str, Any]) -> list[str]:
+    ordered = [
+        "tokenizer",
+        "tokenizer_2",
+        "text_encoder",
+        "text_encoder_2",
+        "vae",
+        "unet",
+        "scheduler",
+    ]
+    return [name for name in ordered if name in components]
 
 
 def resolve_path(repo_root: Path, raw_path: str | Path) -> Path:

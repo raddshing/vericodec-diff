@@ -8,6 +8,7 @@ DEFAULT_LAYER_GROUP_COUNT = 6
 DEFAULT_TIMESTEP_BAND_COUNT = 4
 DEFAULT_NUM_INFERENCE_STEPS = 20
 DEFAULT_CANDIDATE_RANKS = (0, 2, 4, 8, 16)
+DEFAULT_TARGET_MODULES = ("to_k", "to_q", "to_v", "to_out.0")
 
 
 @dataclass(frozen=True)
@@ -189,6 +190,20 @@ def resolve_candidate_ranks(raw_ranks: Sequence[int] | None) -> tuple[int, ...]:
     return normalized
 
 
+def parse_candidate_ranks_argument(
+    raw_value: str | Sequence[int] | None,
+    *,
+    default: Sequence[int] | None = None,
+) -> tuple[int, ...]:
+    if raw_value in (None, ""):
+        return resolve_candidate_ranks(default)
+    if isinstance(raw_value, str):
+        items = [item.strip() for item in raw_value.split(",") if item.strip()]
+    else:
+        items = [str(item).strip() for item in raw_value if str(item).strip()]
+    return resolve_candidate_ranks([int(item) for item in items])
+
+
 def resolve_timestep_values(
     *,
     timesteps: Sequence[int] | None = None,
@@ -323,6 +338,7 @@ __all__ = [
     "DEFAULT_CANDIDATE_RANKS",
     "DEFAULT_LAYER_GROUP_COUNT",
     "DEFAULT_NUM_INFERENCE_STEPS",
+    "DEFAULT_TARGET_MODULES",
     "DEFAULT_TIMESTEP_BAND_COUNT",
     "LayerGroup",
     "LayerSpec",
@@ -332,6 +348,7 @@ __all__ = [
     "build_layer_groups",
     "build_timestep_bands",
     "default_layer_catalog",
+    "parse_candidate_ranks_argument",
     "resolve_candidate_ranks",
     "resolve_layer_catalog",
     "resolve_timestep_values",

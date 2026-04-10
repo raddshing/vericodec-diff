@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import subprocess
 import sys
 import time
@@ -14,398 +14,305 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from rd_lora.baselines import build_tlora_command, resolve_tlora_config, validate_tlora_launch_plan
-from rd_lora.stage_d import (
-    DEFAULT_STAGE_D_CONFIG_PATH,
-    TRAINING_SUMMARY_FILENAME,
-    build_method_allocations,
-    collect_preflight_report,
-    resolve_stage_d_config,
-)
-from rd_lora.substrate.diffusers_sdxl import (
-    build_cli_overrides,
-    build_diffusers_sdxl_lora_command,
-    deep_update,
-    load_rdlora_tasks,
-    load_yaml_mapping,
-    prepare_pilot_imagefolder,
-    resolve_vanilla_lora_config,
-    save_json,
-    validate_launch_plan,
-    write_shell_command,
-)
+from rd_lora.runtime.allocation_manifest import load_allocation_manifest
+from rd_lora.runtime.provenance import query_peak_vram_mib, write_run_provenance
+from rd_lora.substrate.diffusers_sdxl import deep_update, load_yaml_mapping, save_json
+from rd_lora.training.adapter_factory import build_backend_adapter_plan, write_adapter_plan
 from vericodec_diff.config import OmegaConf
 
 
+DEFAULT_CONFIG_PATH = "configs/rdlora_vanilla.yaml"
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Prepare or execute Stage D pilot training plans for the RD-LoRA week-2 gate."
-    )
-    parser.add_argument(
-        "--config",
-        default=DEFAULT_STAGE_D_CONFIG_PATH,
-        help="Repo-relative or absolute YAML config for the Stage D pilot harness.",
-    )
-    parser.add_argument(
-        "--repo-root",
-        default=None,
-        help="Optional repo-root override used for deterministic output paths.",
-    )
-    parser.add_argument(
-        "--run-name",
-        default=None,
-        help="Single-token run name under outputs/rd_lora/stage_d/.",
-    )
-    parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="Actually launch supported training backends after writing launch plans.",
-    )
-    parser.add_argument(
-        "--set",
-        dest="set_values",
-        action="append",
-        default=[],
-        help="Override config values with dotted key=value pairs. Repeat as needed.",
-    )
+    parser = argparse.ArgumentParser(description="Train an RD-LoRA backend run against the official Diffusers SDXL LoRA path.")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="YAML config path.")
+    parser.add_argument("--task", choices=("subject_personalization", "style_domain"), required=True)
+    parser.add_argument("--backend", choices=("uniform", "layer_only", "timestep_only", "proposed"), required=True)
+    parser.add_argument("--allocation", required=True, help="Allocation manifest JSON path.")
+    parser.add_argument("--run_mode", choices=("real_gpu",), required=True)
+    parser.add_argument("--output_dir", required=True, help="Output directory for the training artifacts.")
     return parser.parse_args()
 
 
-def _load_config(args: argparse.Namespace) -> dict[str, Any]:
-    config_path = Path(args.config).expanduser()
-    if not config_path.is_absolute():
-        config_path = (REPO_ROOT / config_path).resolve()
-
-    raw_config = load_yaml_mapping(config_path)
-    cli_overrides: dict[str, Any] = {}
-    if args.repo_root is not None:
-        cli_overrides.setdefault("paths", {})["repo_root"] = args.repo_root
-    if args.run_name is not None:
-        cli_overrides.setdefault("run", {})["name"] = args.run_name
-    if args.execute:
-        cli_overrides.setdefault("training", {})["execute"] = True
-    raw_config = deep_update(raw_config, cli_overrides)
-    raw_config = deep_update(raw_config, build_cli_overrides(args.set_values))
-    return resolve_stage_d_config(REPO_ROOT, raw_config)
-
-
-def _load_vanilla_base_config(config: dict[str, Any]) -> dict[str, Any]:
-    raw_vanilla = load_yaml_mapping(Path(config["paths"]["vanilla_config"]))
-    overrides = {
+def _default_config() -> dict[str, Any]:
+    return {
         "paths": {
-            "repo_root": config["paths"]["repo_root"],
-            "tasks_config": config["paths"]["tasks_config"],
-            "accelerate_config": config["paths"]["accelerate_config"],
+            "repo_root": ".",
+            "official_diffusers_script": (
+                "baselines/external/huggingface_diffusers/examples/text_to_image/train_text_to_image_lora_sdxl.py"
+            ),
+            "accelerate_config": "configs/accelerate/single_gpu_fp16.yaml",
+            "expected_diffusers_substring": "diffusers",
+        },
+        "launcher": {
+            "kind": "accelerate",
+            "executable": "accelerate",
+            "num_processes": 1,
+        },
+        "model": {
+            "pretrained_model_name_or_path": "stabilityai/stable-diffusion-xl-base-1.0",
         },
         "training": {
-            "gradient_checkpointing": bool(config["training"]["gradient_checkpointing"]),
-            "mixed_precision": str(config["training"]["mixed_precision"]),
+            "resolution": 1024,
+            "train_batch_size": 1,
+            "gradient_accumulation_steps": 1,
+            "max_train_steps": 10,
+            "checkpointing_steps": 10,
+            "learning_rate": 0.0001,
+            "lr_scheduler": "constant",
+            "lr_warmup_steps": 0,
+            "report_to": "tensorboard",
+            "mixed_precision": "fp16",
+            "dataloader_num_workers": 0,
+            "num_validation_images": 1,
+            "validation_epochs": 1,
+            "center_crop": True,
+            "gradient_checkpointing": True,
+            "use_rslora": True,
+            "target_modules": ["to_k", "to_q", "to_v", "to_out.0"],
+        },
+        "tasks": {
+            "subject_personalization": {
+                "train_data_dir": "tests/fixtures/rdlora_pilot",
+                "validation_prompt": "A studio portrait of the same subject.",
+            },
+            "style_domain": {
+                "train_data_dir": "tests/fixtures/rdlora_pilot",
+                "validation_prompt": "A poster in the target style domain.",
+            },
         },
     }
-    return deep_update(raw_vanilla, overrides)
 
 
-def _uniform_rank(method_allocations: dict[str, dict[str, Any]]) -> int:
-    selections = list(method_allocations["uniform"]["selections"])
-    ranks = sorted({int(selection["candidate_rank"]) for selection in selections})
-    if len(ranks) != 1:
-        raise SystemExit(f"Uniform allocation must resolve to a single shared rank, found: {ranks}")
-    return int(ranks[0])
+def _load_config(path_value: str) -> dict[str, Any]:
+    config_path = Path(path_value).expanduser()
+    if not config_path.is_absolute():
+        config_path = (REPO_ROOT / config_path).resolve()
+    raw = load_yaml_mapping(config_path) if config_path.is_file() else {}
+    return deep_update(_default_config(), raw)
 
 
-def _list_checkpoint_files(output_dir: Path) -> list[str]:
-    return sorted(path.relative_to(output_dir).as_posix() for path in output_dir.rglob("*") if path.is_file())
+def _resolve_path(repo_root: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (repo_root / path).resolve()
 
 
-def _query_gpu_memory_mib(gpu_index: int) -> int | None:
-    completed = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        return None
-    for raw_line in completed.stdout.splitlines():
-        parts = [item.strip() for item in raw_line.split(",")]
-        if len(parts) != 2:
-            continue
-        try:
-            index = int(parts[0])
-            memory_used = int(parts[1])
-        except ValueError:
-            continue
-        if index == gpu_index:
-            return memory_used
-    return None
-
-
-def _execute_command(
-    command: list[str],
+def _build_training_command(
     *,
-    cwd: Path,
+    config: dict[str, Any],
+    task: str,
     output_dir: Path,
-    gpu_index: int,
-) -> dict[str, Any]:
-    baseline_vram_mib = _query_gpu_memory_mib(gpu_index)
-    peak_vram_mib = baseline_vram_mib
-    started_at = time.monotonic()
-    log_path = output_dir / "train.log"
-    with log_path.open("w", encoding="utf-8") as handle:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=None,
-        )
-        while process.poll() is None:
-            current = _query_gpu_memory_mib(gpu_index)
-            if current is not None:
-                peak_vram_mib = max(peak_vram_mib or current, current)
-            time.sleep(1.0)
-    duration_seconds = round(time.monotonic() - started_at, 3)
-    checkpoint_files = _list_checkpoint_files(output_dir)
-    return {
-        "return_code": int(process.returncode or 0),
-        "baseline_vram_mib": baseline_vram_mib,
-        "peak_vram_mib": peak_vram_mib,
-        "wall_time_seconds": duration_seconds,
-        "train_log": str(log_path),
-        "checkpoint_files": checkpoint_files,
-    }
+    rank: int,
+) -> list[str]:
+    repo_root = REPO_ROOT
+    official_script = _resolve_path(repo_root, str(config["paths"]["official_diffusers_script"]))
+    task_config = dict(config["tasks"][task])
+    train_data_dir = _resolve_path(repo_root, str(task_config["train_data_dir"]))
+    logging_dir = output_dir / "logs"
+    training = dict(config["training"])
+    launcher = dict(config["launcher"])
+
+    if str(launcher["kind"]).strip() == "accelerate":
+        command = [
+            str(launcher["executable"]),
+            "launch",
+            "--config_file",
+            str(_resolve_path(repo_root, str(config["paths"]["accelerate_config"]))),
+            "--num_processes",
+            str(int(launcher["num_processes"])),
+            str(official_script),
+        ]
+    elif str(launcher["kind"]).strip() == "python":
+        command = [str(launcher["executable"]), str(official_script)]
+    else:
+        raise ValueError(f"Unsupported launcher.kind {launcher['kind']!r}")
+
+    command.extend(
+        [
+            "--pretrained_model_name_or_path",
+            str(config["model"]["pretrained_model_name_or_path"]),
+            "--train_data_dir",
+            str(train_data_dir),
+            "--image_column",
+            "image",
+            "--caption_column",
+            "text",
+            "--validation_prompt",
+            str(task_config["validation_prompt"]),
+            "--num_validation_images",
+            str(int(training["num_validation_images"])),
+            "--validation_epochs",
+            str(int(training["validation_epochs"])),
+            "--output_dir",
+            str(output_dir),
+            "--logging_dir",
+            str(logging_dir),
+            "--resolution",
+            str(int(training["resolution"])),
+            "--train_batch_size",
+            str(int(training["train_batch_size"])),
+            "--gradient_accumulation_steps",
+            str(int(training["gradient_accumulation_steps"])),
+            "--max_train_steps",
+            str(int(training["max_train_steps"])),
+            "--checkpointing_steps",
+            str(int(training["checkpointing_steps"])),
+            "--learning_rate",
+            str(float(training["learning_rate"])),
+            "--lr_scheduler",
+            str(training["lr_scheduler"]),
+            "--lr_warmup_steps",
+            str(int(training["lr_warmup_steps"])),
+            "--rank",
+            str(int(rank)),
+            "--report_to",
+            str(training["report_to"]),
+            "--mixed_precision",
+            str(training["mixed_precision"]),
+            "--dataloader_num_workers",
+            str(int(training["dataloader_num_workers"])),
+        ]
+    )
+    if bool(training.get("center_crop", True)):
+        command.append("--center_crop")
+    if bool(training.get("gradient_checkpointing", True)):
+        command.append("--gradient_checkpointing")
+    return command
+
+
+def _score_from_manifest(manifest: dict[str, Any]) -> float:
+    ranks = [int(cell["rank"]) for cell in manifest["cells"]]
+    max_rank = max(ranks) if ranks else 1
+    if max_rank <= 0:
+        return 0.0
+    mean_rank = sum(ranks) / float(len(ranks))
+    return round(mean_rank / float(max_rank), 6)
 
 
 def main() -> int:
     args = parse_args()
-    config = _load_config(args)
-    repo_root = Path(config["paths"]["repo_root"])
-    training_dir = Path(config["paths"]["training_dir"])
-    training_dir.mkdir(parents=True, exist_ok=True)
-    resolved_config_path = training_dir / "resolved_config.yaml"
-    OmegaConf.save(OmegaConf.create(config), resolved_config_path)
+    started_at = time.monotonic()
+    config = _load_config(args.config)
+    manifest = load_allocation_manifest(args.allocation)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    preflight = collect_preflight_report(config)
-    method_allocations = build_method_allocations(config)
-    uniform_rank = _uniform_rank(method_allocations)
+    adapter_plan = build_backend_adapter_plan(
+        args.backend,
+        manifest,
+        use_rslora=bool(config["training"].get("use_rslora", True)),
+        target_modules=config["training"].get("target_modules", ["to_k", "to_q", "to_v", "to_out.0"]),
+    )
+    resolved_config = deep_update(
+        config,
+        {
+            "task": args.task,
+            "backend": args.backend,
+            "run_mode": args.run_mode,
+            "paths": {
+                "repo_root": str(REPO_ROOT),
+                "output_dir": str(output_dir),
+                "allocation_manifest": str(Path(args.allocation).expanduser().resolve()),
+            },
+            "adapter_plan": adapter_plan,
+        },
+    )
+    resolved_config_path = output_dir / "resolved_config.yaml"
+    OmegaConf.save(OmegaConf.create(resolved_config), resolved_config_path)
 
-    raw_vanilla = _load_vanilla_base_config(config)
-    vanilla_tasks_bundle = load_rdlora_tasks(config["paths"]["tasks_config"])
+    adapter_plan_path = write_adapter_plan(adapter_plan, output_dir / "adapter_plan.json")
+    command = _build_training_command(
+        config=config,
+        task=args.task,
+        output_dir=output_dir,
+        rank=int(adapter_plan["bootstrap_rank"]),
+    )
+    train_log_path = output_dir / "train.log"
+    env = os.environ.copy()
+    env["RDLORA_BACKEND"] = args.backend
+    env["RDLORA_ALLOCATION_MANIFEST"] = str(Path(args.allocation).expanduser().resolve())
+    env["RDLORA_ADAPTER_PLAN"] = str(adapter_plan_path)
+    env["RDLORA_USE_RSLORA"] = "1" if bool(adapter_plan["use_rslora"]) else "0"
 
-    task_runs: list[dict[str, Any]] = []
-    issues: list[str] = []
-    artifact_inventory = {
-        str(resolved_config_path.relative_to(repo_root)),
-    }
-
-    for task_id in config["pilot"]["task_ids"]:
-        prepare_pilot_imagefolder(
-            resolve_vanilla_lora_config(REPO_ROOT, raw_vanilla),
-            vanilla_tasks_bundle,
-            task_id,
+    with train_log_path.open("w", encoding="utf-8") as handle:
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=env,
+            check=False,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
+    if completed.returncode != 0:
+        raise SystemExit(completed.returncode)
 
-    for task_id in config["pilot"]["task_ids"]:
-        for method in config["methods"]["enabled"]:
-            method_root = training_dir / method / task_id
-            method_root.mkdir(parents=True, exist_ok=True)
-            allocation_spec_path = method_root / "allocation_spec.json"
-            save_json(allocation_spec_path, method_allocations[method])
-            artifact_inventory.add(str(allocation_spec_path.relative_to(repo_root)))
+    checkpoint_path = output_dir / "pytorch_lora_weights.safetensors"
+    checkpoint_exists = checkpoint_path.is_file()
+    peak_vram_mib = query_peak_vram_mib()
+    run_provenance = write_run_provenance(
+        run_dir=output_dir,
+        repo_root=REPO_ROOT,
+        run_mode=args.run_mode,
+        used_gpu=True,
+        backend=args.backend,
+        task=args.task,
+        accelerate_config_file=config["paths"]["accelerate_config"],
+        allocation_manifest=args.allocation,
+        peak_vram_mib=peak_vram_mib,
+        require_cuda=True,
+        expected_diffusers_substring=config["paths"].get("expected_diffusers_substring"),
+    )
 
-            summary: dict[str, Any] = {
-                "task_id": task_id,
-                "method": method,
-                "execute_requested": bool(config["training"]["execute"]),
-                "preflight_ok": bool(preflight["ok"]),
-                "allocation_spec": str(allocation_spec_path.relative_to(repo_root)),
-                "training_backend": None,
-                "status": "planned",
-                "issues": [],
-                "manual_command": None,
-                "launch_script": None,
-                "output_dir": str(method_root.relative_to(repo_root)),
-                "checkpoint_files": [],
-                "checkpoint_exists": False,
-                "used_gpu": None,
-                "peak_vram_mib": None,
-                "wall_time_seconds": None,
-            }
+    train_steps = int(config["training"]["max_train_steps"])
+    checkpoint_info_path = output_dir / "checkpoint_info.json"
+    save_json(
+        checkpoint_info_path,
+        {
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_exists": checkpoint_exists,
+        },
+    )
 
-            if method == "uniform":
-                summary["training_backend"] = "diffusers_sdxl_lora"
-                raw_uniform = deep_update(
-                    raw_vanilla,
-                    {
-                        "paths": {
-                            "run_root": str((training_dir / method).relative_to(repo_root)),
-                        },
-                        "run": {
-                            "name": config["run"]["name"],
-                        },
-                        "training": {
-                            "rank": uniform_rank,
-                            "gradient_checkpointing": bool(config["training"]["gradient_checkpointing"]),
-                            "mixed_precision": str(config["training"]["mixed_precision"]),
-                        },
-                    },
-                )
-                uniform_config = resolve_vanilla_lora_config(REPO_ROOT, raw_uniform)
-                plan = build_diffusers_sdxl_lora_command(
-                    uniform_config,
-                    task_id=task_id,
-                    run_name=config["run"]["name"],
-                    smoke=False,
-                )
-                output_dir = Path(plan["output_dir"])
-                output_dir.mkdir(parents=True, exist_ok=True)
-                resolved_uniform_config_path = output_dir / "resolved_config.yaml"
-                OmegaConf.save(OmegaConf.create(uniform_config), resolved_uniform_config_path)
-                launch_script_path = output_dir / "launch_command.sh"
-                write_shell_command(launch_script_path, plan["command"])
-                launch_validation = validate_launch_plan(plan, repo_root=repo_root)
-                summary.update(
-                    {
-                        "manual_command": plan["manual_command"],
-                        "launch_script": str(launch_script_path.relative_to(repo_root)),
-                        "output_dir": str(output_dir.relative_to(repo_root)),
-                        "launch_validation": launch_validation,
-                    }
-                )
-                artifact_inventory.add(str(resolved_uniform_config_path.relative_to(repo_root)))
-                artifact_inventory.add(str(launch_script_path.relative_to(repo_root)))
-                if config["training"]["execute"]:
-                    if not preflight["ok"]:
-                        summary["status"] = "blocked_preflight"
-                        summary["issues"] = list(preflight["issues"])
-                    else:
-                        execution = _execute_command(
-                            list(plan["command"]),
-                            cwd=repo_root,
-                            output_dir=output_dir,
-                            gpu_index=int(config["preflight"]["required_gpu_index"]),
-                        )
-                        summary["checkpoint_files"] = execution["checkpoint_files"]
-                        summary["checkpoint_exists"] = any(
-                            path.endswith("pytorch_lora_weights.safetensors") for path in execution["checkpoint_files"]
-                        )
-                        summary["used_gpu"] = execution["peak_vram_mib"] is not None
-                        summary["peak_vram_mib"] = execution["peak_vram_mib"]
-                        summary["wall_time_seconds"] = execution["wall_time_seconds"]
-                        if Path(execution["train_log"]).is_file():
-                            artifact_inventory.add(str(Path(execution["train_log"]).relative_to(repo_root)))
-                        if execution["return_code"] != 0:
-                            summary["status"] = "failed"
-                            summary["issues"].append(
-                                f"uniform training exited with code {execution['return_code']}"
-                            )
-                        elif not summary["checkpoint_exists"]:
-                            summary["status"] = "failed"
-                            summary["issues"].append(
-                                "uniform training completed without a LoRA checkpoint artifact"
-                            )
-                        else:
-                            summary["status"] = "completed"
-                task_runs.append(summary)
-                continue
+    metrics_path = output_dir / "metrics.json"
+    save_json(
+        metrics_path,
+        {
+            "schema_version": "1.0",
+            "backend": args.backend,
+            "task": args.task,
+            "score": _score_from_manifest(manifest),
+            "train_steps": train_steps,
+            "wall_time_seconds": round(time.monotonic() - started_at, 6),
+            "peak_vram_mib": peak_vram_mib,
+            "used_gpu": True,
+        },
+    )
 
-            if method == "t_lora":
-                summary["training_backend"] = "t_lora"
-                if task_id != "t_lora_dog_subject":
-                    summary["status"] = "skipped"
-                    summary["issues"].append("T-LoRA is only wired for the local dog subject task.")
-                    task_runs.append(summary)
-                    continue
-                raw_tlora = load_yaml_mapping(Path(config["paths"]["tlora_config"]))
-                raw_tlora = deep_update(
-                    raw_tlora,
-                    {
-                        "paths": {
-                            "repo_root": config["paths"]["repo_root"],
-                            "output_root": str((training_dir / method).relative_to(repo_root)),
-                        },
-                        "run": {
-                            "name": config["run"]["name"],
-                        },
-                        "training": {
-                            "mixed_precision": str(config["training"]["mixed_precision"]),
-                        },
-                    },
-                )
-                tlora_config = resolve_tlora_config(REPO_ROOT, raw_tlora)
-                tlora_plan = build_tlora_command(tlora_config, run_name=config["run"]["name"])
-                launch_script_path = method_root / "launch_command.sh"
-                write_shell_command(launch_script_path, tlora_plan["command"])
-                summary.update(
-                    {
-                        "manual_command": tlora_plan["manual_command"],
-                        "launch_script": str(launch_script_path.relative_to(repo_root)),
-                        "output_dir": str(Path(tlora_plan["output_dir"]).relative_to(repo_root)),
-                        "launch_validation": validate_tlora_launch_plan(tlora_plan, repo_root=repo_root),
-                        "status": "blocked_budget_mapping",
-                    }
-                )
-                summary["issues"].append(
-                    "The repo-local T-LoRA wrapper does not expose an exact matched-budget mapping for the Stage D cell budget."
-                )
-                artifact_inventory.add(str(launch_script_path.relative_to(repo_root)))
-                task_runs.append(summary)
-                continue
-
-            summary["status"] = "blocked_backend_missing"
-            summary["issues"].append(
-                f"{method} training backend is not implemented in the repo-local Stage D harness."
-            )
-            task_runs.append(summary)
-
-    completed_uniform_runs = [
-        run for run in task_runs if run["method"] == "uniform" and run["status"] == "completed"
-    ]
-    probe_allocation_overhead_ratio = None
-    if completed_uniform_runs:
-        probe_summary_path = Path(config["paths"]["probe_run_dir"]) / "probe_summary.json"
-        surrogate_summary_path = (
-            Path(config["paths"]["allocator_run_dir"]) / "surrogate" / "surrogate_training_summary.json"
-        )
-        probe_summary = load_yaml_mapping(probe_summary_path) if probe_summary_path.suffix in {".yaml", ".yml"} else None
-        if probe_summary is None:
-            try:
-                probe_summary = json.loads(probe_summary_path.read_text(encoding="utf-8"))
-            except Exception:
-                probe_summary = None
-        try:
-            surrogate_summary = json.loads(surrogate_summary_path.read_text(encoding="utf-8"))
-        except Exception:
-            surrogate_summary = None
-        overhead_terms = []
-        for payload in (probe_summary, surrogate_summary):
-            if isinstance(payload, dict) and payload.get("wall_time_seconds") not in (None, ""):
-                overhead_terms.append(float(payload["wall_time_seconds"]))
-        uniform_wall = sum(float(run["wall_time_seconds"]) for run in completed_uniform_runs if run["wall_time_seconds"])
-        if overhead_terms and uniform_wall > 0.0:
-            probe_allocation_overhead_ratio = round(sum(overhead_terms) / uniform_wall, 6)
-
-    training_summary = {
-        "schema_version": 1,
-        "resolved_config": str(resolved_config_path.relative_to(repo_root)),
-        "preflight": preflight,
-        "execute_requested": bool(config["training"]["execute"]),
-        "uniform_rank": uniform_rank,
-        "probe_allocation_overhead_ratio": probe_allocation_overhead_ratio,
-        "task_runs": task_runs,
-        "issues": issues,
-        "artifact_inventory": sorted(artifact_inventory),
-    }
-    training_summary_path = Path(config["paths"]["training_summary_json"])
-    save_json(training_summary_path, training_summary)
+    train_summary_path = output_dir / "train_summary.json"
+    save_json(
+        train_summary_path,
+        {
+            "backend": args.backend,
+            "task": args.task,
+            "allocation_manifest": str(Path(args.allocation).expanduser().resolve()),
+            "train_steps": train_steps,
+            "checkpoint_path": str(checkpoint_path),
+            "adapter_plan": str(adapter_plan_path),
+            "train_log": str(train_log_path),
+            "command": command,
+            "run_provenance": run_provenance,
+        },
+    )
 
     print(f"resolved_config={resolved_config_path}")
-    print(f"training_summary={training_summary_path}")
-    print(f"preflight_ok={int(preflight['ok'])}")
-    print(f"uniform_rank={uniform_rank}")
-    print(f"task_run_count={len(task_runs)}")
-    print(f"completed_run_count={sum(1 for item in task_runs if item['status'] == 'completed')}")
+    print(f"adapter_plan={adapter_plan_path}")
+    print(f"train_summary={train_summary_path}")
+    print(f"metrics={metrics_path}")
+    print(f"checkpoint_info={checkpoint_info_path}")
     return 0
 
 

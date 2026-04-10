@@ -1,181 +1,178 @@
 from __future__ import annotations
 
-import math
+import json
+import sys
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-UTILITY_RECORD_FIELDNAMES = (
+REQUIRED_PROBE_ROW_FIELDNAMES = (
+    "task",
     "cell_id",
+    "layer_group",
+    "timestep_band",
+    "candidate_rank",
+    "pre_loss",
+    "post_loss",
+    "utility",
+    "optimizer_steps",
+    "train_batch_count",
+    "val_batch_count",
+)
+
+# Keep compatibility aliases alongside the required stage-D probe fields.
+UTILITY_RECORD_FIELDNAMES = REQUIRED_PROBE_ROW_FIELDNAMES + (
     "layer_group_id",
     "timestep_band_id",
-    "candidate_rank",
-    "rank_fraction_of_max",
-    "is_attention_cell",
-    "layer_count",
-    "step_count",
-    "event_count",
-    "baseline_mean_abs_drift",
-    "baseline_attention_output_mean_abs_drift",
-    "mean_abs_drift",
-    "rms_drift",
-    "max_abs_drift",
-    "cosine_distance",
-    "attention_output_mean_abs_drift",
-    "attention_output_rms_drift",
-    "attention_output_max_abs_drift",
-    "attention_output_cosine_distance",
     "utility_score",
 )
 
+REQUIRED_PROBE_SUMMARY_KEYS = (
+    "probe_mode",
+    "task",
+    "cell_count",
+    "candidate_ranks",
+    "row_count",
+    "loaded_components",
+    "used_gpu",
+    "peak_vram_mib",
+)
 
-def _round_float(value: float | None) -> float | None:
-    if value is None:
-        return None
-    return round(float(value), 6)
-
-
-def _vector_drift(reference: Sequence[float], candidate: Sequence[float]) -> dict[str, float]:
-    if len(reference) != len(candidate):
-        raise ValueError("reference and candidate vectors must have the same length")
-    if not reference:
-        raise ValueError("reference and candidate vectors must be non-empty")
-
-    deltas = [float(candidate[index]) - float(reference[index]) for index in range(len(reference))]
-    abs_deltas = [abs(value) for value in deltas]
-    mean_abs = sum(abs_deltas) / len(abs_deltas)
-    rms = math.sqrt(sum(value * value for value in deltas) / len(deltas))
-    max_abs = max(abs_deltas)
-
-    ref_norm = math.sqrt(sum(float(value) * float(value) for value in reference))
-    cand_norm = math.sqrt(sum(float(value) * float(value) for value in candidate))
-    if ref_norm == 0.0 or cand_norm == 0.0:
-        cosine_distance = 0.0
-    else:
-        dot = sum(float(reference[index]) * float(candidate[index]) for index in range(len(reference)))
-        cosine_similarity = max(-1.0, min(1.0, dot / (ref_norm * cand_norm)))
-        cosine_distance = 1.0 - cosine_similarity
-
-    return {
-        "mean_abs_drift": mean_abs,
-        "rms_drift": rms,
-        "max_abs_drift": max_abs,
-        "cosine_distance": cosine_distance,
-    }
+REQUIRED_PROVENANCE_KEYS = (
+    "run_mode",
+    "used_gpu",
+    "peak_vram_mib",
+    "python",
+    "torch",
+    "torch_cuda_is_available",
+    "torch_device_count",
+    "gpu_names",
+    "diffusers",
+    "diffusers_file",
+)
 
 
-def summarize_ranked_events(
-    events: Sequence[Mapping[str, Any]],
+def _round_float(value: float | int, *, digits: int = 6) -> float:
+    return round(float(value), digits)
+
+
+def build_probe_row(
     *,
+    task: str,
+    cell_id: str,
+    layer_group: str,
+    timestep_band: str,
     candidate_rank: int,
-    include_attention_output_drift: bool,
+    pre_loss: float,
+    post_loss: float,
+    optimizer_steps: int,
+    train_batch_count: int,
+    val_batch_count: int,
 ) -> dict[str, Any]:
-    if not events:
-        raise ValueError("events must not be empty")
-
-    mean_abs_values: list[float] = []
-    rms_values: list[float] = []
-    max_abs_values: list[float] = []
-    cosine_values: list[float] = []
-    attention_mean_abs_values: list[float] = []
-    attention_rms_values: list[float] = []
-    attention_max_abs_values: list[float] = []
-    attention_cosine_values: list[float] = []
-
-    for event in events:
-        reference_output = event["reference_output"]
-        candidate_output = event["candidate_outputs"][candidate_rank]
-        drift = _vector_drift(reference_output, candidate_output)
-        mean_abs_values.append(drift["mean_abs_drift"])
-        rms_values.append(drift["rms_drift"])
-        max_abs_values.append(drift["max_abs_drift"])
-        cosine_values.append(drift["cosine_distance"])
-        if include_attention_output_drift and str(event.get("layer_kind")) == "attention":
-            attention_mean_abs_values.append(drift["mean_abs_drift"])
-            attention_rms_values.append(drift["rms_drift"])
-            attention_max_abs_values.append(drift["max_abs_drift"])
-            attention_cosine_values.append(drift["cosine_distance"])
-
-    attention_enabled = bool(include_attention_output_drift and attention_mean_abs_values)
+    utility = float(pre_loss) - float(post_loss)
     return {
-        "event_count": len(events),
-        "mean_abs_drift": sum(mean_abs_values) / len(mean_abs_values),
-        "rms_drift": sum(rms_values) / len(rms_values),
-        "max_abs_drift": max(max_abs_values),
-        "cosine_distance": sum(cosine_values) / len(cosine_values),
-        "attention_output_mean_abs_drift": (
-            sum(attention_mean_abs_values) / len(attention_mean_abs_values) if attention_enabled else None
-        ),
-        "attention_output_rms_drift": sum(attention_rms_values) / len(attention_rms_values) if attention_enabled else None,
-        "attention_output_max_abs_drift": max(attention_max_abs_values) if attention_enabled else None,
-        "attention_output_cosine_distance": (
-            sum(attention_cosine_values) / len(attention_cosine_values) if attention_enabled else None
-        ),
+        "task": str(task),
+        "cell_id": str(cell_id),
+        "layer_group": str(layer_group),
+        "timestep_band": str(timestep_band),
+        "candidate_rank": int(candidate_rank),
+        "pre_loss": _round_float(pre_loss),
+        "post_loss": _round_float(post_loss),
+        "utility": _round_float(utility),
+        "optimizer_steps": int(optimizer_steps),
+        "train_batch_count": int(train_batch_count),
+        "val_batch_count": int(val_batch_count),
+        "layer_group_id": str(layer_group),
+        "timestep_band_id": str(timestep_band),
+        "utility_score": _round_float(utility),
     }
 
 
-def build_cell_utility_records(
+def build_probe_summary(
     *,
-    cell: Mapping[str, Any],
-    events: Sequence[Mapping[str, Any]],
+    probe_mode: str,
+    task: str,
+    cell_count: int,
     candidate_ranks: Sequence[int],
-    include_attention_output_drift: bool,
-) -> list[dict[str, Any]]:
-    ranks = tuple(int(rank) for rank in candidate_ranks)
-    if not ranks:
-        raise ValueError("candidate_ranks must not be empty")
-    if ranks[0] != 0:
-        raise ValueError("candidate_ranks must start with rank 0")
+    row_count: int,
+    loaded_components: Sequence[str],
+    used_gpu: bool,
+    peak_vram_mib: float | int | None,
+) -> dict[str, Any]:
+    return {
+        "probe_mode": str(probe_mode),
+        "task": str(task),
+        "cell_count": int(cell_count),
+        "candidate_ranks": [int(rank) for rank in candidate_ranks],
+        "row_count": int(row_count),
+        "loaded_components": [str(component) for component in loaded_components],
+        "used_gpu": bool(used_gpu),
+        "peak_vram_mib": 0.0 if peak_vram_mib in (None, "") else _round_float(float(peak_vram_mib), digits=3),
+    }
 
-    baseline = summarize_ranked_events(
-        events,
-        candidate_rank=0,
-        include_attention_output_drift=include_attention_output_drift,
-    )
-    max_rank = max(ranks)
-    records: list[dict[str, Any]] = []
-    for rank in ranks:
-        summary = summarize_ranked_events(
-            events,
-            candidate_rank=rank,
-            include_attention_output_drift=include_attention_output_drift,
-        )
-        baseline_attention = baseline["attention_output_mean_abs_drift"] or 0.0
-        current_attention = summary["attention_output_mean_abs_drift"] or 0.0
-        utility_score = max(0.0, baseline["mean_abs_drift"] - summary["mean_abs_drift"])
-        utility_score += 0.5 * max(0.0, baseline_attention - current_attention)
-        rank_fraction = float(rank) / float(max_rank) if max_rank > 0 else 0.0
 
-        records.append(
-            {
-                "cell_id": str(cell["cell_id"]),
-                "layer_group_id": str(cell["layer_group_id"]),
-                "timestep_band_id": str(cell["timestep_band_id"]),
-                "candidate_rank": rank,
-                "rank_fraction_of_max": _round_float(rank_fraction),
-                "is_attention_cell": bool(cell["is_attention_cell"]),
-                "layer_count": int(cell["layer_count"]),
-                "step_count": int(cell["step_count"]),
-                "event_count": int(summary["event_count"]),
-                "baseline_mean_abs_drift": _round_float(baseline["mean_abs_drift"]),
-                "baseline_attention_output_mean_abs_drift": _round_float(
-                    baseline["attention_output_mean_abs_drift"]
-                ),
-                "mean_abs_drift": _round_float(summary["mean_abs_drift"]),
-                "rms_drift": _round_float(summary["rms_drift"]),
-                "max_abs_drift": _round_float(summary["max_abs_drift"]),
-                "cosine_distance": _round_float(summary["cosine_distance"]),
-                "attention_output_mean_abs_drift": _round_float(summary["attention_output_mean_abs_drift"]),
-                "attention_output_rms_drift": _round_float(summary["attention_output_rms_drift"]),
-                "attention_output_max_abs_drift": _round_float(summary["attention_output_max_abs_drift"]),
-                "attention_output_cosine_distance": _round_float(summary["attention_output_cosine_distance"]),
-                "utility_score": _round_float(utility_score),
-            }
-        )
-    return records
+def collect_run_provenance(
+    *,
+    run_mode: str,
+    used_gpu: bool,
+    peak_vram_mib: float | int | None,
+) -> dict[str, Any]:
+    import diffusers  # type: ignore
+    import torch  # type: ignore
+
+    gpu_names = []
+    device_count = 0
+    cuda_is_available = bool(torch.cuda.is_available())
+    if cuda_is_available:
+        device_count = int(torch.cuda.device_count())
+        for index in range(device_count):
+            gpu_names.append(str(torch.cuda.get_device_name(index)))
+
+    return {
+        "run_mode": str(run_mode),
+        "used_gpu": bool(used_gpu),
+        "peak_vram_mib": 0.0 if peak_vram_mib in (None, "") else _round_float(float(peak_vram_mib), digits=3),
+        "python": sys.version.split()[0],
+        "torch": str(getattr(torch, "__version__", "unknown")),
+        "torch_cuda_is_available": cuda_is_available,
+        "torch_device_count": device_count,
+        "gpu_names": gpu_names,
+        "diffusers": str(getattr(diffusers, "__version__", "unknown")),
+        "diffusers_file": str(Path(getattr(diffusers, "__file__", "")).resolve()),
+    }
+
+
+def validate_probe_payloads(
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> None:
+    for row in rows:
+        missing = [field for field in REQUIRED_PROBE_ROW_FIELDNAMES if field not in row]
+        if missing:
+            raise ValueError(f"Probe row is missing required fields: {missing}")
+    missing_summary = [field for field in REQUIRED_PROBE_SUMMARY_KEYS if field not in summary]
+    if missing_summary:
+        raise ValueError(f"Probe summary is missing required fields: {missing_summary}")
+    missing_provenance = [field for field in REQUIRED_PROVENANCE_KEYS if field not in provenance]
+    if missing_provenance:
+        raise ValueError(f"Run provenance is missing required fields: {missing_provenance}")
+
+
+def save_json_payload(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dict(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 __all__ = [
+    "REQUIRED_PROBE_ROW_FIELDNAMES",
+    "REQUIRED_PROBE_SUMMARY_KEYS",
+    "REQUIRED_PROVENANCE_KEYS",
     "UTILITY_RECORD_FIELDNAMES",
-    "build_cell_utility_records",
-    "summarize_ranked_events",
+    "build_probe_row",
+    "build_probe_summary",
+    "collect_run_provenance",
+    "save_json_payload",
+    "validate_probe_payloads",
 ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -10,82 +11,83 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from rd_lora.cells import parse_candidate_ranks_argument
 from rd_lora.probe import (
-    DEFAULT_PROBE_CONFIG_PATH,
+    ProbeValidationError,
+    build_run_request,
+    default_probe_config,
+    dispatch_probe,
     resolve_probe_config,
-    run_probe,
-    validate_probe_outputs,
+    write_probe_outputs,
 )
-from rd_lora.substrate.diffusers_sdxl import build_cli_overrides, deep_update, load_yaml_mapping
+from rd_lora.substrate.diffusers_sdxl import deep_update, load_yaml_mapping
 from vericodec_diff.config import OmegaConf
 
 
-def parse_args() -> argparse.Namespace:
+DEFAULT_CONFIG_PATH = "configs/rdlora_probe.yaml"
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the RD-LoRA week-2 probe instrumentation and write deterministic JSON/CSV artifacts."
+        description="Probe RD-LoRA-Diff cells with either a real SDXL GPU forward/backward path or an explicit cpu_mock path."
     )
-    parser.add_argument(
-        "--config",
-        default=DEFAULT_PROBE_CONFIG_PATH,
-        help="Repo-relative or absolute YAML config for the RD-LoRA probe run.",
-    )
-    parser.add_argument(
-        "--repo-root",
-        default=None,
-        help="Optional repo-root override used for deterministic output paths.",
-    )
-    parser.add_argument(
-        "--run-name",
-        default=None,
-        help="Single-token run name under outputs/rd_lora/probe/.",
-    )
-    parser.add_argument(
-        "--set",
-        dest="set_values",
-        action="append",
-        default=[],
-        help="Override config values with dotted key=value pairs. Repeat as needed.",
-    )
-    return parser.parse_args()
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="YAML config path.")
+    parser.add_argument("--task", choices=("subject_personalization", "style_domain"), required=True)
+    parser.add_argument("--run_mode", choices=("real_gpu", "cpu_mock"), required=True)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--max_cells", type=int, default=None)
+    parser.add_argument("--candidate_ranks", default=None, help="Comma-separated ranks, for example 0,2,4,8,16.")
+    parser.add_argument("--probe_inner_steps", type=int, default=None)
+    parser.add_argument("--max_train_batches", type=int, default=None)
+    parser.add_argument("--max_val_batches", type=int, default=None)
+    return parser.parse_args(argv)
 
 
-def _load_config(args: argparse.Namespace) -> dict[str, object]:
-    config_path = Path(args.config).expanduser()
-    if not config_path.is_absolute():
-        config_path = (REPO_ROOT / config_path).resolve()
-
-    raw_config = load_yaml_mapping(config_path)
-    cli_overrides: dict[str, object] = {}
-    if args.repo_root is not None:
-        cli_overrides.setdefault("paths", {})["repo_root"] = args.repo_root
-    if args.run_name is not None:
-        cli_overrides.setdefault("run", {})["name"] = args.run_name
-    raw_config = deep_update(raw_config, cli_overrides)
-    raw_config = deep_update(raw_config, build_cli_overrides(args.set_values))
-    return resolve_probe_config(REPO_ROOT, raw_config)
+def _load_config(config_path: str) -> dict[str, object]:
+    path = Path(config_path).expanduser()
+    if not path.is_absolute():
+        path = (REPO_ROOT / path).resolve()
+    raw = load_yaml_mapping(path) if path.is_file() else {}
+    return deep_update(default_probe_config(), raw)
 
 
-def main() -> int:
-    args = parse_args()
-    config = _load_config(args)
-    output_dir = Path(config["paths"]["output_dir"])
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    resolved_config_path = output_dir / "resolved_config.yaml"
-    OmegaConf.save(OmegaConf.create(config), resolved_config_path)
+    config = resolve_probe_config(REPO_ROOT, _load_config(args.config))
+    request = build_run_request(
+        config=config,
+        task=args.task,
+        run_mode=args.run_mode,
+        output_dir=output_dir,
+        max_cells=args.max_cells,
+        candidate_ranks=parse_candidate_ranks_argument(args.candidate_ranks) if args.candidate_ranks else None,
+        probe_inner_steps=args.probe_inner_steps,
+        max_train_batches=args.max_train_batches,
+        max_val_batches=args.max_val_batches,
+    )
 
-    summary = run_probe(config, resolved_config_path=resolved_config_path)
-    validation = validate_probe_outputs(output_dir)
+    resolved_config_path = output_dir / "resolved_config.yaml"
+    OmegaConf.save(OmegaConf.create(request), resolved_config_path)
+
+    try:
+        payload = dispatch_probe(request)
+    except ProbeValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    outputs = write_probe_outputs(
+        output_dir,
+        payload,
+        task=str(request["task"]),
+        candidate_ranks=request["probe"]["candidate_ranks"],
+    )
 
     print(f"resolved_config={resolved_config_path}")
-    print(f"summary={output_dir / 'probe_summary.json'}")
-    print(f"cell_schema={output_dir / 'cell_schema.json'}")
-    print(f"utility_records_json={output_dir / 'utility_records.json'}")
-    print(f"utility_records_csv={output_dir / 'utility_records.csv'}")
-    print(f"cell_count={summary['cell_count']}")
-    print(f"record_count={summary['record_count']}")
-    print(f"preflight_ok={int(summary['preflight']['ok'])}")
-    print(f"schema_validation_ok={int(validation['ok'])}")
+    for key, value in outputs.items():
+        print(f"{key}={value}")
     return 0
 
 

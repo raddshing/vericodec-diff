@@ -139,6 +139,14 @@ def collect_run_provenance(
         "gpu_names": gpu_names,
         "diffusers": str(getattr(diffusers, "__version__", "unknown")),
         "diffusers_file": str(Path(getattr(diffusers, "__file__", "")).resolve()),
+        "schema_version": "1.0",
+        "torch_cuda_version": str(getattr(torch.version, "cuda", "N/A")),
+        "accelerate_config_file": "",
+        "git_commit": "",
+        "backend": "probe",
+        "task": "",
+        "allocation_manifest": "",
+        "timestamp_utc": __import__("datetime").datetime.utcnow().isoformat() + "Z",
     }
 
 

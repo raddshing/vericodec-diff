@@ -8,33 +8,41 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import pandas as pd
 
-from rd_lora.features import UTILITY_RECORD_FIELDNAMES
 
-
-DEFAULT_SURROGATE_TARGET = "utility_score"
-DEFAULT_SURROGATE_FEATURE_NAMES = (
+REQUIRED_PROBE_COLUMNS = (
+    "task",
+    "cell_id",
+    "layer_group",
+    "timestep_band",
+    "candidate_rank",
+    "pre_loss",
+    "post_loss",
+    "utility",
+    "optimizer_steps",
+    "train_batch_count",
+    "val_batch_count",
+)
+SURROGATE_FEATURES_V1 = [
     "candidate_rank",
     "rank_fraction_of_max",
-    "is_attention_cell",
-    "layer_count",
-    "step_count",
-    "event_count",
-    "baseline_mean_abs_drift",
-    "mean_abs_drift",
-    "rms_drift",
-    "max_abs_drift",
-    "cosine_distance",
-    "baseline_attention_output_mean_abs_drift",
-    "attention_output_mean_abs_drift",
-    "attention_output_rms_drift",
-    "attention_output_max_abs_drift",
-    "attention_output_cosine_distance",
-    "mean_abs_improvement",
-    "attention_mean_abs_improvement",
-    "has_attention_measurements",
-)
-SURROGATE_PREDICTION_FIELDNAMES = UTILITY_RECORD_FIELDNAMES + (
+    "optimizer_steps",
+    "train_batch_count",
+    "val_batch_count",
+    "pre_loss",
+    "layer_group_id",
+    "timestep_band_id",
+    "task_id",
+]
+DEFAULT_SURROGATE_TARGET = "utility"
+DEFAULT_SURROGATE_FEATURE_NAMES = tuple(SURROGATE_FEATURES_V1)
+SURROGATE_PREDICTION_FIELDNAMES = REQUIRED_PROBE_COLUMNS + (
+    "utility_score",
+    "rank_fraction_of_max",
+    "layer_group_id",
+    "timestep_band_id",
+    "task_id",
     "predicted_utility",
     "residual_utility",
 )
@@ -64,61 +72,156 @@ def _as_float(value: Any) -> float:
     return float(value)
 
 
-def sort_utility_records(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    for record in records:
-        payload = dict(record)
-        missing = sorted(set(UTILITY_RECORD_FIELDNAMES) - set(payload))
-        if missing:
-            raise SurrogateValidationError(f"Utility record is missing fields: {missing}")
-        normalized.append(payload)
-    return sorted(
-        normalized,
-        key=lambda item: (
-            str(item["cell_id"]),
-            int(item["candidate_rank"]),
-            str(item["layer_group_id"]),
-            str(item["timestep_band_id"]),
-        ),
+def _resolve_probe_artifact_paths(probe_path: Path) -> tuple[Path, Path]:
+    resolved = probe_path.expanduser()
+    if resolved.is_dir() or not resolved.suffix:
+        return resolved / "cell_utility.csv", resolved / "cell_utility.json"
+    if resolved.suffix == ".csv":
+        return resolved, resolved.with_name("cell_utility.json")
+    if resolved.suffix == ".json":
+        return resolved.with_name("cell_utility.csv"), resolved
+    return resolved / "cell_utility.csv", resolved / "cell_utility.json"
+
+
+def _read_probe_dataframe(probe_path: Path) -> pd.DataFrame:
+    csv_path, json_path = _resolve_probe_artifact_paths(probe_path)
+    if csv_path.is_file():
+        return pd.read_csv(csv_path)
+    if json_path.is_file():
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise SurrogateValidationError(f"{json_path} must parse to a mapping")
+        rows = payload.get("rows")
+        if rows is None:
+            rows = payload.get("records")
+        if not isinstance(rows, list):
+            raise SurrogateValidationError(f"{json_path} must define a rows or records list")
+        return pd.DataFrame(rows)
+    raise FileNotFoundError(f"Missing {csv_path.name} and {json_path.name} under {csv_path.parent}")
+
+
+def _ensure_dataframe(records: Sequence[Mapping[str, Any]] | pd.DataFrame) -> pd.DataFrame:
+    if isinstance(records, pd.DataFrame):
+        return records.copy()
+    return pd.DataFrame([dict(record) for record in records])
+
+
+def _encode_categorical(values: pd.Series) -> pd.Series:
+    string_values = values.astype(str)
+    categories = sorted(string_values.unique().tolist())
+    return pd.Series(
+        pd.Categorical(string_values, categories=categories, ordered=True).codes,
+        index=values.index,
+        dtype=np.int64,
     )
 
 
-def load_utility_records(path: Path) -> list[dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise SurrogateValidationError(f"{path} must parse to a mapping")
-    records = payload.get("records")
-    if not isinstance(records, list):
-        raise SurrogateValidationError(f"{path} must define a records list")
-    return sort_utility_records(records)
+def normalize_probe_dataframe(
+    frame: pd.DataFrame,
+    *,
+    force_recompute: bool = False,
+) -> pd.DataFrame:
+    normalized = frame.copy()
+    if normalized.empty:
+        raise SurrogateValidationError("Probe artifact contains no rows")
 
+    if "utility" not in normalized.columns and "utility_score" in normalized.columns:
+        normalized["utility"] = normalized["utility_score"]
 
-def _feature_value(record: Mapping[str, Any], feature_name: str) -> float:
-    if feature_name == "mean_abs_improvement":
-        return _as_float(record["baseline_mean_abs_drift"]) - _as_float(record["mean_abs_drift"])
-    if feature_name == "attention_mean_abs_improvement":
-        return _as_float(record["baseline_attention_output_mean_abs_drift"]) - _as_float(
-            record["attention_output_mean_abs_drift"]
+    missing = sorted(set(REQUIRED_PROBE_COLUMNS) - set(normalized.columns))
+    if missing:
+        raise SurrogateValidationError(f"Missing required probe columns: {missing}")
+
+    for column in ("task", "cell_id", "layer_group", "timestep_band"):
+        normalized[column] = normalized[column].astype(str)
+
+    integer_columns = (
+        "candidate_rank",
+        "optimizer_steps",
+        "train_batch_count",
+        "val_batch_count",
+    )
+    float_columns = ("pre_loss", "post_loss", "utility")
+
+    for column in integer_columns:
+        normalized[column] = pd.to_numeric(normalized[column], errors="raise").astype(np.int64)
+    for column in float_columns:
+        normalized[column] = pd.to_numeric(normalized[column], errors="raise").astype(np.float64)
+
+    max_candidate_rank = max(int(normalized["candidate_rank"].max()), 1)
+    if force_recompute or "rank_fraction_of_max" not in normalized.columns:
+        normalized["rank_fraction_of_max"] = normalized["candidate_rank"].astype(np.float64) / float(max_candidate_rank)
+    else:
+        normalized["rank_fraction_of_max"] = pd.to_numeric(
+            normalized["rank_fraction_of_max"],
+            errors="raise",
+        ).astype(np.float64)
+
+    derived_categorical_columns = (
+        ("layer_group", "layer_group_id"),
+        ("timestep_band", "timestep_band_id"),
+        ("task", "task_id"),
+    )
+    for source_column, target_column in derived_categorical_columns:
+        should_recompute = (
+            force_recompute
+            or target_column not in normalized.columns
+            or not pd.api.types.is_numeric_dtype(normalized[target_column])
         )
-    if feature_name == "has_attention_measurements":
-        return 1.0 if record.get("attention_output_mean_abs_drift") is not None else 0.0
-    if feature_name not in record:
-        raise SurrogateValidationError(f"Unknown surrogate feature {feature_name!r}")
-    return _as_float(record[feature_name])
+        if should_recompute:
+            normalized[target_column] = _encode_categorical(normalized[source_column])
+        else:
+            normalized[target_column] = pd.to_numeric(normalized[target_column], errors="raise").astype(np.int64)
+
+    normalized["utility_score"] = normalized["utility"].astype(np.float64)
+
+    return normalized.sort_values(
+        by=["task", "cell_id", "candidate_rank", "layer_group_id", "timestep_band_id"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def load_probe_dataframe(probe_path: Path) -> pd.DataFrame:
+    return normalize_probe_dataframe(_read_probe_dataframe(probe_path), force_recompute=True)
+
+
+def sort_utility_records(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    normalized = normalize_probe_dataframe(_ensure_dataframe(records))
+    return normalized.to_dict(orient="records")
+
+
+def load_utility_records(path: Path) -> list[dict[str, Any]]:
+    return load_probe_dataframe(path).to_dict(orient="records")
 
 
 def build_feature_vector(record: Mapping[str, Any], feature_names: Sequence[str]) -> tuple[float, ...]:
-    return tuple(_feature_value(record, feature_name) for feature_name in feature_names)
+    values: list[float] = []
+    for feature_name in feature_names:
+        if feature_name not in record:
+            raise SurrogateValidationError(f"Unknown surrogate feature {feature_name!r}")
+        values.append(_as_float(record[feature_name]))
+    return tuple(values)
 
 
-def build_feature_matrix(records: Sequence[Mapping[str, Any]], feature_names: Sequence[str]) -> np.ndarray:
-    return np.asarray([build_feature_vector(record, feature_names) for record in records], dtype=np.float64)
+def build_feature_matrix(
+    records: Sequence[Mapping[str, Any]] | pd.DataFrame,
+    feature_names: Sequence[str],
+) -> np.ndarray:
+    normalized = normalize_probe_dataframe(_ensure_dataframe(records))
+    missing = [feature_name for feature_name in feature_names if feature_name not in normalized.columns]
+    if missing:
+        raise SurrogateValidationError(f"Unknown surrogate features: {missing}")
+    return normalized.loc[:, list(feature_names)].to_numpy(dtype=np.float64)
 
 
-def build_target_vector(records: Sequence[Mapping[str, Any]], target_name: str) -> np.ndarray:
+def build_target_vector(
+    records: Sequence[Mapping[str, Any]] | pd.DataFrame,
+    target_name: str,
+) -> np.ndarray:
     if target_name != DEFAULT_SURROGATE_TARGET:
         raise SurrogateValidationError(f"Unsupported surrogate target {target_name!r}")
-    return np.asarray([_as_float(record[target_name]) for record in records], dtype=np.float64)
+    normalized = normalize_probe_dataframe(_ensure_dataframe(records))
+    return normalized[target_name].to_numpy(dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -220,9 +323,11 @@ def fit_linear_surrogate(
     sorted_records = sort_utility_records(records)
     if not sorted_records:
         raise SurrogateValidationError("At least one utility record is required")
+
     normalized_feature_names = tuple(str(value) for value in feature_names)
     if not normalized_feature_names:
         raise SurrogateValidationError("surrogate.feature_names must not be empty")
+
     l2_value = float(l2_regularization)
     if l2_value < 0.0:
         raise SurrogateValidationError("surrogate.l2_regularization must be non-negative")
@@ -280,14 +385,19 @@ __all__ = [
     "DEFAULT_SURROGATE_FEATURE_NAMES",
     "DEFAULT_SURROGATE_TARGET",
     "LinearUtilitySurrogate",
+    "REQUIRED_PROBE_COLUMNS",
+    "SURROGATE_FEATURES_V1",
     "SURROGATE_METRIC_FIELDNAMES",
     "SURROGATE_PREDICTION_FIELDNAMES",
     "SurrogateValidationError",
     "build_feature_matrix",
     "build_feature_vector",
+    "build_target_vector",
     "compute_prediction_metrics",
     "fit_linear_surrogate",
+    "load_probe_dataframe",
     "load_utility_records",
+    "normalize_probe_dataframe",
     "score_records",
     "sort_utility_records",
     "write_metric_csv",

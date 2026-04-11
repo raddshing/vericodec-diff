@@ -1011,7 +1011,6 @@ def execute_training_run(
             total_batches_processed += 1
             skip_noop_batch = False
             with accelerator.accumulate(components["unet"]) if hasattr(accelerator, "accumulate") else nullcontext():
-                optimizer.zero_grad()
                 _set_active_timestep_band_marker(components["unet"], None)
                 loss, last_active_adapter_name = compute_step_loss(
                     torch_module=torch_module,
@@ -1032,6 +1031,7 @@ def execute_training_run(
                 )
                 skip_noop_batch = bool(routed_timestep_band["noop"])
                 if not skip_noop_batch:
+                    optimizer.zero_grad()
                     accelerator.backward(loss)
                     if getattr(accelerator, "sync_gradients", True) and hasattr(accelerator, "clip_grad_norm_"):
                         accelerator.clip_grad_norm_(trainable_parameters, training_args.max_grad_norm)

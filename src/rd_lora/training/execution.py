@@ -25,7 +25,8 @@ from rd_lora.training.adapter_factory import (
 )
 from rd_lora.training.timestep_routing import (
     TimestepRoutingError,
-    resolve_active_adapter_name_for_training_timesteps,
+    build_timestep_band_routes,
+    resolve_timestep_band_name_for_training_timesteps,
 )
 
 
@@ -52,6 +53,9 @@ REQUIRED_METRIC_KEYS = (
     "global_step",
     "train_loss_last",
     "train_loss_mean",
+    "skipped_noop_band_batches",
+    "skipped_noop_band_fraction",
+    "active_band_optimizer_steps",
 )
 
 
@@ -441,6 +445,91 @@ def create_lr_scheduler(
     )
 
 
+def _plan_timestep_band_routes(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    routes = plan.get("timestep_band_routes")
+    if isinstance(routes, Mapping) and routes:
+        return {
+            str(timestep_band): dict(route)
+            for timestep_band, route in routes.items()
+        }
+
+    routing = _require_mapping(plan.get("routing", {}), name="plan.routing")
+    if str(routing.get("mode")) == "timestep_band":
+        table = routing.get("table")
+        if not isinstance(table, Mapping) or not table:
+            raise TrainingExecutionError("plan.routing.table must be a non-empty mapping")
+        return {
+            str(timestep_band): dict(route)
+            for timestep_band, route in table.items()
+        }
+
+    timestep_bands = plan.get("timestep_bands")
+    if not isinstance(timestep_bands, Sequence) or isinstance(timestep_bands, (str, bytes)):
+        raise TrainingExecutionError("plan.timestep_bands must be a sequence")
+    try:
+        return build_timestep_band_routes([str(timestep_band) for timestep_band in timestep_bands])
+    except TimestepRoutingError as exc:
+        raise TrainingExecutionError(f"Unable to synthesize timestep band routes: {exc}") from exc
+
+
+def _synthesize_timestep_band_metadata(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    timestep_bands = plan.get("timestep_bands")
+    if not isinstance(timestep_bands, Sequence) or isinstance(timestep_bands, (str, bytes)):
+        raise TrainingExecutionError("plan.timestep_bands must be a sequence")
+    cell_configs = plan.get("cell_configs")
+    if not isinstance(cell_configs, Mapping):
+        raise TrainingExecutionError("plan must expose timestep_band_metadata or cell_configs")
+
+    grouped_cells = {str(timestep_band): [] for timestep_band in timestep_bands}
+    for raw_cell_id, raw_cell in cell_configs.items():
+        if not isinstance(raw_cell, Mapping):
+            raise TrainingExecutionError(f"plan.cell_configs[{raw_cell_id!r}] must be a mapping")
+        cell = dict(raw_cell)
+        timestep_band = str(cell.get("timestep_band", "")).strip()
+        if timestep_band not in grouped_cells:
+            raise TrainingExecutionError(
+                f"plan.cell_configs[{raw_cell_id!r}] references unknown timestep_band {timestep_band!r}"
+            )
+        grouped_cells[timestep_band].append((str(raw_cell_id), cell))
+
+    metadata: dict[str, dict[str, Any]] = {}
+    for timestep_band in timestep_bands:
+        ordered_cells = sorted(grouped_cells[str(timestep_band)], key=lambda item: item[0])
+        positive_rank_cell_count = sum(1 for _cell_id, cell in ordered_cells if int(cell["rank"]) > 0)
+        metadata[str(timestep_band)] = {
+            "timestep_band": str(timestep_band),
+            "cell_ids": [cell_id for cell_id, _cell in ordered_cells],
+            "cell_count": len(ordered_cells),
+            "positive_rank_cell_count": positive_rank_cell_count,
+            "zero_rank_cell_count": len(ordered_cells) - positive_rank_cell_count,
+            "has_trainable_params": positive_rank_cell_count > 0,
+            "noop": positive_rank_cell_count == 0,
+        }
+    return metadata
+
+
+def _plan_timestep_band_metadata(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    metadata = plan.get("timestep_band_metadata")
+    if isinstance(metadata, Mapping) and metadata:
+        return {
+            str(timestep_band): dict(payload)
+            for timestep_band, payload in metadata.items()
+        }
+    return _synthesize_timestep_band_metadata(plan)
+
+
+def _set_active_timestep_band_marker(unet: Any, timestep_band: str | None) -> None:
+    try:
+        setattr(unet, "_rd_lora_active_timestep_band", "" if timestep_band is None else str(timestep_band))
+    except Exception:
+        return None
+
+
+def _active_timestep_band_marker(unet: Any) -> str:
+    value = getattr(unet, "_rd_lora_active_timestep_band", "")
+    return str(value).strip()
+
+
 def _adapter_spec_lookup(adapter_specs: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
     return {
         str(spec["adapter_name"]): dict(spec)
@@ -468,19 +557,74 @@ def select_active_adapter_name(
     timesteps: Sequence[int],
     num_train_timesteps: int,
 ) -> str:
+    active_timestep_band = select_active_timestep_band_name(
+        plan=plan,
+        timesteps=timesteps,
+        num_train_timesteps=num_train_timesteps,
+    )
     routing = dict(plan["routing"])
     if routing["mode"] == "static":
-        return str(routing["default_adapter_name"])
-    if routing["mode"] != "timestep_band":
+        adapter_name = str(routing["default_adapter_name"])
+    elif routing["mode"] == "timestep_band":
+        adapter_name = str(dict(routing["table"][active_timestep_band]).get("adapter_name", ""))
+    else:
         raise TrainingExecutionError(f"Unsupported routing mode {routing['mode']!r}")
+    if not adapter_name:
+        raise TrainingExecutionError(f"Routing entry for {active_timestep_band!r} is missing adapter_name")
+    return adapter_name
+
+
+def select_active_timestep_band_name(
+    *,
+    plan: Mapping[str, Any],
+    timesteps: Sequence[int],
+    num_train_timesteps: int,
+) -> str:
     try:
-        return resolve_active_adapter_name_for_training_timesteps(
-            routing["table"],
+        return resolve_timestep_band_name_for_training_timesteps(
+            _plan_timestep_band_routes(plan),
             timesteps=timesteps,
             num_train_timesteps=num_train_timesteps,
         )
     except TimestepRoutingError as exc:
         raise TrainingExecutionError(f"Timestep routing failed: {exc}") from exc
+
+
+def _resolve_routed_timestep_band_metadata(
+    *,
+    plan: Mapping[str, Any],
+    unet: Any,
+    active_adapter_name: str,
+    timestep_band_metadata: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    active_timestep_band = _active_timestep_band_marker(unet)
+    if active_timestep_band:
+        if active_timestep_band not in timestep_band_metadata:
+            raise TrainingExecutionError(f"Unknown routed timestep band {active_timestep_band!r}")
+        return dict(timestep_band_metadata[active_timestep_band])
+
+    routing = dict(plan["routing"])
+    if routing["mode"] == "static":
+        noop_values = {bool(dict(metadata).get("noop", False)) for metadata in timestep_band_metadata.values()}
+        if len(noop_values) != 1:
+            raise TrainingExecutionError(
+                "Static routing cannot infer routed timestep-band noop state from mixed per-band metadata"
+            )
+        first_band_name = sorted(str(timestep_band) for timestep_band in timestep_band_metadata)[0]
+        return dict(timestep_band_metadata[first_band_name])
+    if routing["mode"] != "timestep_band":
+        raise TrainingExecutionError(f"Unsupported routing mode {routing['mode']!r}")
+
+    matches = [
+        str(timestep_band)
+        for timestep_band, route in dict(routing["table"]).items()
+        if str(dict(route).get("adapter_name", "")).strip() == str(active_adapter_name).strip()
+    ]
+    if len(matches) != 1:
+        raise TrainingExecutionError(
+            f"Unable to resolve timestep band from adapter_name {active_adapter_name!r}; matches={matches}"
+        )
+    return dict(timestep_band_metadata[matches[0]])
 
 
 def _compute_time_ids(
@@ -535,11 +679,17 @@ def compute_step_loss(
     ).long()
 
     timestep_values = [int(value) for value in timesteps.detach().flatten().tolist()]
+    active_timestep_band = select_active_timestep_band_name(
+        plan=plan,
+        timesteps=timestep_values,
+        num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
+    )
     active_adapter_name = select_active_adapter_name(
         plan=plan,
         timesteps=timestep_values,
         num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
     )
+    _set_active_timestep_band_marker(unet, active_timestep_band)
     _activate_adapter(unet, adapter_name=active_adapter_name, adapter_spec_by_name=adapter_spec_by_name)
 
     noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
@@ -607,6 +757,21 @@ def _peak_vram_mib_from_torch(torch_module: Any) -> float | None:
     return round(raw_bytes / float(1024**2), 3)
 
 
+def _validate_metrics_payload(metrics: Mapping[str, Any]) -> None:
+    for key in REQUIRED_METRIC_KEYS:
+        if key not in metrics:
+            raise TrainingExecutionError(f"metrics.json is missing key {key!r}")
+    if int(metrics["global_step"]) <= 0:
+        raise TrainingExecutionError("metrics.global_step must be positive")
+    if int(metrics["skipped_noop_band_batches"]) < 0:
+        raise TrainingExecutionError("metrics.skipped_noop_band_batches must be non-negative")
+    skipped_noop_band_fraction = float(metrics["skipped_noop_band_fraction"])
+    if skipped_noop_band_fraction < 0.0 or skipped_noop_band_fraction > 1.0:
+        raise TrainingExecutionError("metrics.skipped_noop_band_fraction must be in [0.0, 1.0]")
+    if int(metrics["active_band_optimizer_steps"]) != int(metrics["global_step"]):
+        raise TrainingExecutionError("metrics.active_band_optimizer_steps must equal metrics.global_step")
+
+
 def write_success_artifacts(
     *,
     output_dir: Path,
@@ -623,11 +788,7 @@ def write_success_artifacts(
     checkpoint_path = Path(str(checkpoint_info["checkpoint_path"])).expanduser().resolve()
     if not bool(checkpoint_info["checkpoint_exists"]) or not checkpoint_path.exists():
         raise TrainingExecutionError("Success artifacts require a real checkpoint path on disk")
-    for key in REQUIRED_METRIC_KEYS:
-        if key not in metrics:
-            raise TrainingExecutionError(f"metrics.json is missing key {key!r}")
-    if int(metrics["global_step"]) <= 0:
-        raise TrainingExecutionError("metrics.global_step must be positive")
+    _validate_metrics_payload(metrics)
 
     save_json(output_dir / "checkpoint_info.json", checkpoint_info)
     save_json(output_dir / "metrics.json", metrics)
@@ -708,9 +869,7 @@ def validate_training_output_artifacts(output_dir: str | Path) -> dict[str, Any]
     missing_checkpoint_info = [key for key in REQUIRED_CHECKPOINT_INFO_KEYS if key not in checkpoint_info]
     if missing_checkpoint_info:
         raise TrainingExecutionError(f"checkpoint_info.json is missing keys: {missing_checkpoint_info}")
-    missing_metrics = [key for key in REQUIRED_METRIC_KEYS if key not in metrics]
-    if missing_metrics:
-        raise TrainingExecutionError(f"metrics.json is missing keys: {missing_metrics}")
+    _validate_metrics_payload(metrics)
 
     checkpoint_path = Path(str(checkpoint_info["checkpoint_path"])).expanduser().resolve()
     if str(train_summary["checkpoint_path"]) != str(checkpoint_path):
@@ -719,8 +878,6 @@ def validate_training_output_artifacts(output_dir: str | Path) -> dict[str, Any]
         raise TrainingExecutionError("checkpoint_info.checkpoint_exists must be true for a successful run")
     if not checkpoint_path.exists():
         raise TrainingExecutionError(f"checkpoint_path does not exist on disk: {checkpoint_path}")
-    if int(metrics["global_step"]) <= 0:
-        raise TrainingExecutionError("metrics.global_step must be positive")
     return {
         "run_provenance": provenance,
         "train_summary": train_summary,
@@ -826,6 +983,7 @@ def execute_training_run(
         lr_scheduler,
     )
     adapter_spec_by_name = _adapter_spec_lookup(adapter_specs)
+    timestep_band_metadata = _plan_timestep_band_metadata(plan)
     static_adapter_name = str(dict(plan["routing"]).get("default_adapter_name", ""))
     if dict(plan["routing"])["mode"] == "static":
         _activate_adapter(
@@ -838,17 +996,23 @@ def execute_training_run(
         accelerator.init_trackers("dreambooth-lora-sd-xl", config={"task": task, "backend": backend})
 
     global_step = 0
+    skipped_noop_band_batches = 0
+    total_batches_processed = 0
     recorded_losses: list[float] = []
     last_checkpoint_path: Path | None = None
     last_active_adapter_name = static_adapter_name
-    num_update_steps_per_epoch = max(1, math.ceil(len(train_dataloader) / training_args.gradient_accumulation_steps))
-    num_train_epochs = max(1, math.ceil(training_args.max_train_steps / num_update_steps_per_epoch))
+    max_train_steps = int(training_args.max_train_steps)
 
-    for _epoch in range(num_train_epochs):
+    while global_step < max_train_steps:
         components["unet"].train()
+        batches_in_epoch = 0
         for batch in train_dataloader:
+            batches_in_epoch += 1
+            total_batches_processed += 1
+            skip_noop_batch = False
             with accelerator.accumulate(components["unet"]) if hasattr(accelerator, "accumulate") else nullcontext():
                 optimizer.zero_grad()
+                _set_active_timestep_band_marker(components["unet"], None)
                 loss, last_active_adapter_name = compute_step_loss(
                     torch_module=torch_module,
                     official_module=official_module,
@@ -860,13 +1024,24 @@ def execute_training_run(
                     runtime_state=runtime_state,
                     batch=batch,
                 )
-                accelerator.backward(loss)
-                if getattr(accelerator, "sync_gradients", True) and hasattr(accelerator, "clip_grad_norm_"):
-                    accelerator.clip_grad_norm_(trainable_parameters, training_args.max_grad_norm)
-                optimizer.step()
-                if lr_scheduler is not None:
-                    lr_scheduler.step()
+                routed_timestep_band = _resolve_routed_timestep_band_metadata(
+                    plan=plan,
+                    unet=components["unet"],
+                    active_adapter_name=last_active_adapter_name,
+                    timestep_band_metadata=timestep_band_metadata,
+                )
+                skip_noop_batch = bool(routed_timestep_band["noop"])
+                if not skip_noop_batch:
+                    accelerator.backward(loss)
+                    if getattr(accelerator, "sync_gradients", True) and hasattr(accelerator, "clip_grad_norm_"):
+                        accelerator.clip_grad_norm_(trainable_parameters, training_args.max_grad_norm)
+                    optimizer.step()
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
 
+            if skip_noop_batch:
+                skipped_noop_band_batches += 1
+                continue
             if getattr(accelerator, "sync_gradients", True):
                 global_step += 1
                 loss_value = float(loss.detach().item())
@@ -879,10 +1054,10 @@ def execute_training_run(
                         output_dir=output_dir_path,
                         global_step=global_step,
                     )
-            if global_step >= int(training_args.max_train_steps):
+            if global_step >= max_train_steps:
                 break
-        if global_step >= int(training_args.max_train_steps):
-            break
+        if batches_in_epoch <= 0:
+            raise TrainingExecutionError("train_dataloader must yield at least one batch")
 
     if global_step <= 0:
         raise TrainingExecutionError("Training exited without any optimizer steps")
@@ -919,6 +1094,12 @@ def execute_training_run(
         "train_loss_last": float(recorded_losses[-1]),
         "train_loss_mean": round(sum(recorded_losses) / len(recorded_losses), 6),
         "learning_rate_last": float(lr_scheduler.get_last_lr()[0]) if lr_scheduler is not None else None,
+        "skipped_noop_band_batches": int(skipped_noop_band_batches),
+        "skipped_noop_band_fraction": round(
+            float(skipped_noop_band_batches) / float(total_batches_processed),
+            6,
+        ),
+        "active_band_optimizer_steps": int(global_step),
     }
     train_summary = {
         "status": TRAINING_SUCCESS_STATUS,

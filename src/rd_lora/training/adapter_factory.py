@@ -337,6 +337,36 @@ def _group_cell_ids(
     return grouped
 
 
+def _build_timestep_band_metadata(
+    cells_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    timestep_bands: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    cell_ids_by_band = _group_cell_ids(
+        cells_by_id,
+        field_name="timestep_band",
+        ordered_names=timestep_bands,
+    )
+    metadata: dict[str, dict[str, Any]] = {}
+    for timestep_band in timestep_bands:
+        band_cell_ids = list(cell_ids_by_band[str(timestep_band)])
+        positive_rank_cell_count = sum(
+            1
+            for cell_id in band_cell_ids
+            if int(cells_by_id[str(cell_id)]["rank"]) > 0
+        )
+        metadata[str(timestep_band)] = {
+            "timestep_band": str(timestep_band),
+            "cell_ids": band_cell_ids,
+            "cell_count": len(band_cell_ids),
+            "positive_rank_cell_count": positive_rank_cell_count,
+            "zero_rank_cell_count": len(band_cell_ids) - positive_rank_cell_count,
+            "has_trainable_params": positive_rank_cell_count > 0,
+            "noop": positive_rank_cell_count == 0,
+        }
+    return metadata
+
+
 def _module_patterns_for_cell_ids(
     cell_ids: Sequence[str],
     *,
@@ -385,6 +415,11 @@ def build_backend_plan(
     layer_group_module_map = _schema_layer_group_module_map(
         schema,
         target_modules=normalized_config["target_modules"],
+    )
+    timestep_band_routes = build_timestep_band_routes(timestep_bands, schema=schema)
+    timestep_band_metadata = _build_timestep_band_metadata(
+        cells_by_id,
+        timestep_bands=timestep_bands,
     )
 
     adapter_banks: list[dict[str, Any]] = []
@@ -461,11 +496,10 @@ def build_backend_plan(
         }
 
     elif backend in {"timestep_only", "proposed"}:
-        cell_ids_by_band = _group_cell_ids(
-            cells_by_id,
-            field_name="timestep_band",
-            ordered_names=timestep_bands,
-        )
+        cell_ids_by_band = {
+            str(timestep_band): list(timestep_band_metadata[str(timestep_band)]["cell_ids"])
+            for timestep_band in timestep_bands
+        }
         band_to_adapter: dict[str, str] = {}
         for timestep_band in timestep_bands:
             band_cell_ids = cell_ids_by_band[timestep_band]
@@ -489,13 +523,14 @@ def build_backend_plan(
                 "module_names": module_names,
                 "rank_pattern": rank_pattern,
                 "alpha_pattern": alpha_pattern,
+                "has_trainable_params": bool(timestep_band_metadata[timestep_band]["has_trainable_params"]),
+                "noop": bool(timestep_band_metadata[timestep_band]["noop"]),
             }
             if backend == "timestep_only":
                 bank["rank"] = _single_value(band_cells, "rank", backend=backend, scope=timestep_band)
                 bank["alpha"] = _single_value(band_cells, "alpha", backend=backend, scope=timestep_band)
             adapter_banks.append(bank)
-        routes = build_timestep_band_routes(timestep_bands, schema=schema)
-        routing_table = build_adapter_routing_table(routes, band_to_adapter=band_to_adapter)
+        routing_table = build_adapter_routing_table(timestep_band_routes, band_to_adapter=band_to_adapter)
         routing = {
             "mode": "timestep_band",
             "table": routing_table,
@@ -514,6 +549,8 @@ def build_backend_plan(
         "rank_budget_total": int(normalized_manifest["rank_budget_total"]),
         "layer_groups": layer_groups,
         "timestep_bands": timestep_bands,
+        "timestep_band_routes": timestep_band_routes,
+        "timestep_band_metadata": timestep_band_metadata,
         "cell_ids": ordered_cell_ids,
         "cell_configs": {
             cell_id: dict(cells_by_id[cell_id])

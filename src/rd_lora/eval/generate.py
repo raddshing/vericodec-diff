@@ -91,7 +91,10 @@ def load_eval_pipeline(
 
     dtype = _resolve_torch_dtype(torch_dtype)
     pipe = StableDiffusionXLPipeline.from_pretrained(base_model_id)
-    pipe.load_lora_weights(str(checkpoint_path))
+    try:
+        pipe.load_lora_weights(str(checkpoint_path), weight_name="pytorch_lora_weights.safetensors")
+    except TypeError:
+        pipe.load_lora_weights(str(checkpoint_path))
     pipe = pipe.to(device=device, torch_dtype=dtype)
     return pipe
 

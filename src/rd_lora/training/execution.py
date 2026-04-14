@@ -1233,6 +1233,58 @@ def execute_training_run(
         train_dataloader,
         lr_scheduler,
     )
+
+    def save_model_hook(models: list[Any], weights: list[Any], output_dir: str) -> None:
+        if not getattr(accelerator, "is_main_process", True):
+            return
+
+        from peft.utils import get_peft_model_state_dict
+
+        try:
+            from diffusers.utils import convert_state_dict_to_diffusers
+        except ImportError:
+            from diffusers.loaders.lora_conversion_utils import convert_state_dict_to_diffusers
+
+        for model in models:
+            if hasattr(model, "peft_config"):
+                state_dict = get_peft_model_state_dict(model)
+                unet_lora_layers = convert_state_dict_to_diffusers(state_dict)
+                from diffusers import StableDiffusionXLPipeline as _ExportPipeline
+
+                _ExportPipeline.save_lora_weights(
+                    output_dir,
+                    unet_lora_layers=unet_lora_layers,
+                )
+            if weights:
+                weights.pop()
+
+    def load_model_hook(models: list[Any], input_dir: str) -> None:
+        from peft.utils import set_peft_model_state_dict
+
+        try:
+            from diffusers.loaders.lora_pipeline import StableDiffusionLoraLoaderMixin
+        except ImportError:
+            from diffusers.loaders import StableDiffusionLoraLoaderMixin
+
+        from diffusers.utils import convert_unet_state_dict_to_peft
+
+        while len(models) > 0:
+            model = models.pop()
+            if hasattr(model, "peft_config"):
+                lora_state_dict, _ = StableDiffusionLoraLoaderMixin.lora_state_dict(input_dir)
+                unet_state_dict = {
+                    key.replace("unet.", ""): value
+                    for key, value in lora_state_dict.items()
+                    if key.startswith("unet.")
+                }
+                unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+                set_peft_model_state_dict(model, unet_state_dict, adapter_name="default")
+
+    if hasattr(accelerator, "register_save_state_pre_hook"):
+        accelerator.register_save_state_pre_hook(save_model_hook)
+    if hasattr(accelerator, "register_load_state_pre_hook"):
+        accelerator.register_load_state_pre_hook(load_model_hook)
+
     timestep_band_metadata = _plan_timestep_band_metadata(plan)
     routing_table = _plan_timestep_band_routes(plan)
     static_adapter_name = _normalize_optional_adapter_name(dict(plan["routing"]).get("default_adapter_name"))

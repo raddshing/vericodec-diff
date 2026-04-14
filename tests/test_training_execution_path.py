@@ -73,17 +73,27 @@ def _config() -> dict[str, object]:
 
 
 class FakeParam:
-    def __init__(self, *, requires_grad: bool = False) -> None:
+    def __init__(self, *, requires_grad: bool = False, name: str = "") -> None:
         self.requires_grad = requires_grad
+        self.grad = None
+        self.name = name
+
+    def numel(self) -> int:
+        return 1
 
 
 class FakeModel:
     def __init__(self, *, parameter_count: int = 2) -> None:
-        self._parameters = [FakeParam(requires_grad=False) for _ in range(parameter_count)]
+        self._parameters = [
+            FakeParam(requires_grad=False, name=f"base_param_{i}") for i in range(parameter_count)
+        ]
         self.peft_config: dict[str, object] = {}
 
     def parameters(self):  # noqa: ANN201
         return list(self._parameters)
+
+    def named_parameters(self):  # noqa: ANN201
+        return [(p.name, p) for p in self._parameters]
 
     def named_modules(self):  # noqa: ANN201
         return []
@@ -154,7 +164,7 @@ class FakeOptimizer:
         self.zero_grad_calls = 0
         self.step_calls = 0
 
-    def zero_grad(self) -> None:
+    def zero_grad(self, set_to_none: bool = False) -> None:
         self.zero_grad_calls += 1
 
     def step(self) -> None:
@@ -172,6 +182,9 @@ class FakeAccelerator:
         self.logged_steps: list[int] = []
 
     def prepare(self, *items):  # noqa: ANN002
+        for item in items:
+            if hasattr(item, "named_parameters"):
+                self._model = item
         return items
 
     def accumulate(self, _model):  # noqa: ANN001
@@ -179,6 +192,10 @@ class FakeAccelerator:
 
     def backward(self, loss: FakeLoss) -> None:
         self.backward_calls.append(loss)
+        if hasattr(self, "_model"):
+            for param in self._model.parameters():
+                if param.requires_grad:
+                    param.grad = True
 
     def clip_grad_norm_(self, _parameters, _max_grad_norm) -> None:  # noqa: ANN001
         return None
@@ -279,8 +296,11 @@ def test_real_execution_path_loads_components_and_runs_backward_step_checkpoint(
         ],
     )
 
-    def fake_apply_adapter_specs(**kwargs) -> None:  # noqa: ANN003
-        kwargs["unet"].parameters()[1].requires_grad = True
+    def fake_apply_adapter_specs(**kwargs) -> list[str]:  # noqa: ANN003
+        param = kwargs["unet"].parameters()[1]
+        param.requires_grad = True
+        param.name = "unet.to_q.uniform_bank.lora_A.weight"
+        return ["uniform_bank"]
 
     monkeypatch.setattr(execution, "apply_adapter_specs", fake_apply_adapter_specs)
     monkeypatch.setattr(execution, "create_train_dataloader", lambda **_kwargs: [{"batch": 1}])

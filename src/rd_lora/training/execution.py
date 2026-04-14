@@ -1246,9 +1246,12 @@ def execute_training_run(
             from diffusers.loaders.lora_conversion_utils import convert_state_dict_to_diffusers
 
         for model in models:
-            if hasattr(model, "peft_config"):
-                state_dict = get_peft_model_state_dict(model)
-                unet_lora_layers = convert_state_dict_to_diffusers(state_dict)
+            if hasattr(model, "peft_config") and model.peft_config:
+                merged_state_dict = {}
+                for adapter_name in model.peft_config:
+                    adapter_sd = get_peft_model_state_dict(model, adapter_name=adapter_name)
+                    merged_state_dict.update(adapter_sd)
+                unet_lora_layers = convert_state_dict_to_diffusers(merged_state_dict)
                 from diffusers import StableDiffusionXLPipeline as _ExportPipeline
 
                 _ExportPipeline.save_lora_weights(

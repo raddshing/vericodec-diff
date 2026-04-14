@@ -537,18 +537,76 @@ def _adapter_spec_lookup(adapter_specs: Sequence[Mapping[str, Any]]) -> dict[str
     }
 
 
+def _normalize_optional_adapter_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def _activate_adapter(unet: Any, *, adapter_name: str, adapter_spec_by_name: Mapping[str, Mapping[str, Any]]) -> None:
     if adapter_name not in adapter_spec_by_name:
         raise TrainingExecutionError(f"Unknown adapter_name {adapter_name!r}")
     spec = adapter_spec_by_name[adapter_name]
     if bool(spec["noop"]):
-        if not hasattr(unet, "disable_adapters"):
-            raise TrainingExecutionError("UNet does not support disabling adapters for a zero-rank timestep band")
-        unet.disable_adapters()
-        return
+        raise TrainingExecutionError(f"Cannot activate noop adapter spec {adapter_name!r}")
     if hasattr(unet, "enable_adapters"):
         unet.enable_adapters()
     unet.set_adapter(adapter_name)
+
+
+def _optimizer_parameters(optimizer: Any) -> list[Any]:
+    param_groups = getattr(optimizer, "param_groups", None)
+    if isinstance(param_groups, Sequence):
+        parameters: list[Any] = []
+        for group_index, group in enumerate(param_groups):
+            if not isinstance(group, Mapping):
+                raise TrainingExecutionError(f"optimizer.param_groups[{group_index}] must be a mapping")
+            group_params = group.get("params")
+            if not isinstance(group_params, Sequence):
+                raise TrainingExecutionError(f"optimizer.param_groups[{group_index}].params must be a sequence")
+            parameters.extend(list(group_params))
+        return parameters
+    parameters = getattr(optimizer, "parameters", None)
+    if isinstance(parameters, Sequence):
+        return list(parameters)
+    raise TrainingExecutionError("optimizer must expose param_groups or parameters for coverage checks")
+
+
+def _assert_no_noop_adapter_specs(adapter_spec_by_name: Mapping[str, Mapping[str, Any]]) -> None:
+    noop_adapter_names = sorted(
+        adapter_name
+        for adapter_name, spec in adapter_spec_by_name.items()
+        if bool(spec.get("noop", False))
+    )
+    if noop_adapter_names:
+        raise TrainingExecutionError(
+            f"Noop adapter specs must not exist in adapter_spec_by_name; discovered={noop_adapter_names}"
+        )
+
+
+def _assert_optimizer_parameter_coverage(
+    *,
+    trainable_parameters: Sequence[Any],
+    optimizer: Any,
+) -> None:
+    optimizer_parameters = _optimizer_parameters(optimizer)
+    optimizer_counts: dict[int, int] = {}
+    for parameter in optimizer_parameters:
+        parameter_id = id(parameter)
+        optimizer_counts[parameter_id] = optimizer_counts.get(parameter_id, 0) + 1
+    missing = [parameter for parameter in trainable_parameters if optimizer_counts.get(id(parameter), 0) == 0]
+    duplicated = [parameter for parameter in trainable_parameters if optimizer_counts.get(id(parameter), 0) > 1]
+    if missing or duplicated:
+        raise TrainingExecutionError(
+            "Optimizer parameter groups must cover each trainable adapter parameter exactly once; "
+            f"missing={len(missing)} duplicated={len(duplicated)}"
+        )
+
+
+def _assert_optimizer_has_grad(optimizer: Any) -> None:
+    if not any(getattr(parameter, "grad", None) is not None for parameter in _optimizer_parameters(optimizer)):
+        raise TrainingExecutionError("Backward pass did not produce gradients for optimizer parameters")
 
 
 def select_active_adapter_name(
@@ -557,7 +615,7 @@ def select_active_adapter_name(
     timesteps: Sequence[int],
     num_train_timesteps: int,
     active_timestep_band: str | None = None,
-) -> str:
+) -> str | None:
     if active_timestep_band is None:
         active_timestep_band = select_active_timestep_band_name(
             plan=plan,
@@ -566,12 +624,12 @@ def select_active_adapter_name(
         )
     routing = dict(plan["routing"])
     if routing["mode"] == "static":
-        adapter_name = str(routing["default_adapter_name"])
+        adapter_name = _normalize_optional_adapter_name(routing.get("default_adapter_name"))
     elif routing["mode"] == "timestep_band":
-        adapter_name = str(dict(routing["table"][active_timestep_band]).get("adapter_name", ""))
+        adapter_name = _normalize_optional_adapter_name(dict(routing["table"][active_timestep_band]).get("adapter_name"))
     else:
         raise TrainingExecutionError(f"Unsupported routing mode {routing['mode']!r}")
-    if not adapter_name:
+    if routing["mode"] == "static" and adapter_name is None:
         raise TrainingExecutionError(f"Routing entry for {active_timestep_band!r} is missing adapter_name")
     return adapter_name
 
@@ -639,20 +697,24 @@ def _plan_timestep_band_batch_route(
         timesteps=timestep_values,
         num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
     )
-    active_adapter_name = select_active_adapter_name(
-        plan=plan,
-        timesteps=timestep_values,
-        num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
-        active_timestep_band=active_timestep_band,
-    )
     if active_timestep_band not in timestep_band_metadata:
         raise TrainingExecutionError(f"Unknown routed timestep band {active_timestep_band!r}")
+    routing = dict(plan["routing"])
+    if str(routing.get("mode")) != "timestep_band":
+        raise TrainingExecutionError("Timestep-band batch routing requires plan.routing.mode='timestep_band'")
+    routing_entry = dict(routing["table"][active_timestep_band])
     routed_timestep_band = dict(timestep_band_metadata[active_timestep_band])
+    noop = bool(routing_entry.get("noop", False))
+    if noop != bool(routed_timestep_band["noop"]):
+        raise TrainingExecutionError(
+            f"Routing noop mismatch for {active_timestep_band!r}: route={noop} metadata={routed_timestep_band['noop']}"
+        )
+    adapter_name = _normalize_optional_adapter_name(routing_entry.get("adapter_name"))
     return {
         "timesteps": timesteps,
         "active_timestep_band": active_timestep_band,
-        "active_adapter_name": active_adapter_name,
-        "noop": bool(routed_timestep_band["noop"]),
+        "adapter_name": adapter_name,
+        "noop": noop,
     }
 
 
@@ -720,7 +782,7 @@ def compute_step_loss(
     timesteps: Any | None = None,
     active_timestep_band: str | None = None,
     active_adapter_name: str | None = None,
-) -> tuple[Any, str]:
+) -> Any:
     vae = components["vae"]
     unet = components["unet"]
     noise_scheduler = components["scheduler"]
@@ -740,7 +802,6 @@ def compute_step_loss(
 
     noise = torch_module.randn_like(model_input)
     batch_size = model_input.shape[0]
-    route_was_precomputed = active_timestep_band is not None and active_adapter_name is not None
     if timesteps is None:
         timesteps = torch_module.randint(
             0,
@@ -769,9 +830,10 @@ def compute_step_loss(
             num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
             active_timestep_band=active_timestep_band,
         )
-    if not route_was_precomputed:
-        _set_active_timestep_band_marker(unet, active_timestep_band)
-        _activate_adapter(unet, adapter_name=active_adapter_name, adapter_spec_by_name=adapter_spec_by_name)
+    if active_adapter_name is None:
+        raise TrainingExecutionError(
+            f"compute_step_loss cannot run without a concrete adapter_name for timestep band {active_timestep_band!r}"
+        )
 
     noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
     prompt_embeds, pooled_prompt_embeds = official_module.encode_prompt(
@@ -814,7 +876,7 @@ def compute_step_loss(
         raise TrainingExecutionError(f"Unknown prediction type {prediction_type!r}")
 
     loss = official_module.F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-    return loss, active_adapter_name
+    return loss
 
 
 def save_checkpoint(*, accelerator: Any, output_dir: Path, global_step: int) -> Path:
@@ -1035,6 +1097,8 @@ def execute_training_run(
         use_rslora=bool(plan["use_rslora"]),
         lora_dropout=float(training_args.lora_dropout),
     )
+    adapter_spec_by_name = _adapter_spec_lookup(adapter_specs)
+    _assert_no_noop_adapter_specs(adapter_spec_by_name)
     if training_args.mixed_precision == "fp16":
         official_module.cast_training_params([components["unet"]], dtype=torch_module.float32)
 
@@ -1043,6 +1107,10 @@ def execute_training_run(
         torch_module=torch_module,
         trainable_parameters=trainable_parameters,
         training_args=training_args,
+    )
+    _assert_optimizer_parameter_coverage(
+        trainable_parameters=trainable_parameters,
+        optimizer=optimizer,
     )
     train_dataloader = create_train_dataloader(
         torch_module=torch_module,
@@ -1063,10 +1131,11 @@ def execute_training_run(
         train_dataloader,
         lr_scheduler,
     )
-    adapter_spec_by_name = _adapter_spec_lookup(adapter_specs)
     timestep_band_metadata = _plan_timestep_band_metadata(plan)
-    static_adapter_name = str(dict(plan["routing"]).get("default_adapter_name", ""))
+    static_adapter_name = _normalize_optional_adapter_name(dict(plan["routing"]).get("default_adapter_name"))
     if dict(plan["routing"])["mode"] == "static":
+        if static_adapter_name is None:
+            raise TrainingExecutionError("Static routing requires a concrete default_adapter_name")
         _activate_adapter(
             components["unet"],
             adapter_name=static_adapter_name,
@@ -1095,31 +1164,44 @@ def execute_training_run(
             optimizer_step_completed = False
             step_timesteps: Any | None = None
             active_timestep_band: str | None = None
-            active_adapter_name_for_step: str | None = None
+            adapter_name: str | None = None
             _set_active_timestep_band_marker(components["unet"], None)
             if routing_mode == "timestep_band":
-                step_route = _plan_timestep_band_batch_route(
+                route = _plan_timestep_band_batch_route(
                     torch_module=torch_module,
                     plan=plan,
                     components=components,
                     batch=batch,
                     timestep_band_metadata=timestep_band_metadata,
                 )
-                step_timesteps = step_route["timesteps"]
-                active_timestep_band = str(step_route["active_timestep_band"])
-                active_adapter_name_for_step = str(step_route["active_adapter_name"])
-                last_active_adapter_name = active_adapter_name_for_step
-                _set_active_timestep_band_marker(components["unet"], active_timestep_band)
-                _activate_adapter(
-                    components["unet"],
-                    adapter_name=active_adapter_name_for_step,
-                    adapter_spec_by_name=adapter_spec_by_name,
-                )
-                if bool(step_route["noop"]):
+                step_timesteps = route["timesteps"]
+                active_timestep_band = str(route["active_timestep_band"])
+                adapter_name = route["adapter_name"]
+                if bool(route["noop"]):
+                    if adapter_name is not None:
+                        raise TrainingExecutionError(
+                            f"Routed noop timestep band {active_timestep_band!r} must not expose an adapter_name"
+                        )
                     skipped_noop_band_batches += 1
                     continue
+                if adapter_name is None:
+                    raise TrainingExecutionError(
+                        f"Trainable timestep band {active_timestep_band!r} must expose a concrete adapter_name"
+                    )
+                if adapter_name not in adapter_spec_by_name:
+                    raise TrainingExecutionError(f"Unknown routed adapter_name {adapter_name!r}")
+                spec = adapter_spec_by_name[adapter_name]
+                if bool(spec["noop"]):
+                    raise TrainingExecutionError(f"Routed adapter_name {adapter_name!r} cannot resolve to a noop spec")
+                if hasattr(components["unet"], "enable_adapters"):
+                    components["unet"].enable_adapters()
+                components["unet"].set_adapter(adapter_name)
+                last_active_adapter_name = adapter_name
+                _set_active_timestep_band_marker(components["unet"], active_timestep_band)
+            else:
+                adapter_name = static_adapter_name
             with accelerator.accumulate(components["unet"]) if hasattr(accelerator, "accumulate") else nullcontext():
-                loss, last_active_adapter_name = compute_step_loss(
+                loss = compute_step_loss(
                     torch_module=torch_module,
                     official_module=official_module,
                     accelerator=accelerator,
@@ -1131,15 +1213,25 @@ def execute_training_run(
                     batch=batch,
                     timesteps=step_timesteps,
                     active_timestep_band=active_timestep_band,
-                    active_adapter_name=active_adapter_name_for_step,
+                    active_adapter_name=adapter_name,
                 )
+                if isinstance(loss, tuple):
+                    reported_loss, reported_adapter_name = loss
+                    normalized_reported_adapter_name = _normalize_optional_adapter_name(reported_adapter_name)
+                    if normalized_reported_adapter_name != adapter_name:
+                        raise TrainingExecutionError(
+                            "compute_step_loss reported a mismatched adapter_name; "
+                            f"expected={adapter_name!r} reported={normalized_reported_adapter_name!r}"
+                        )
+                    loss = reported_loss
                 accelerator.backward(loss)
+                _assert_optimizer_has_grad(optimizer)
                 if getattr(accelerator, "sync_gradients", True) and hasattr(accelerator, "clip_grad_norm_"):
                     accelerator.clip_grad_norm_(trainable_parameters, training_args.max_grad_norm)
                 optimizer.step()
                 if lr_scheduler is not None:
                     lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 optimizer_step_completed = bool(getattr(accelerator, "sync_gradients", True))
 
             if optimizer_step_completed:

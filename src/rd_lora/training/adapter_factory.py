@@ -8,11 +8,7 @@ from typing import Any, Mapping, Sequence
 
 from rd_lora.cells import CellSchema, build_cell_schema, validate_cell_targets
 from rd_lora.runtime.allocation_manifest import load_allocation_manifest, validate_allocation_manifest
-from rd_lora.training.timestep_routing import (
-    build_adapter_routing_table,
-    build_timestep_band_routes,
-    describe_routing_table,
-)
+from rd_lora.training.timestep_routing import build_timestep_band_routes
 
 
 ALLOWED_TARGET_MODULES = ("to_k", "to_q", "to_v", "to_out.0")
@@ -510,6 +506,8 @@ def build_backend_plan(
                     f"{backend} backend requires one adapter_name for {timestep_band!r}; discovered={sorted(adapter_names)}"
                 )
             adapter_name = next(iter(adapter_names))
+            if bool(timestep_band_metadata[timestep_band]["noop"]):
+                continue
             band_to_adapter[timestep_band] = adapter_name
             module_names, rank_pattern, alpha_pattern = _module_patterns_for_cell_ids(
                 band_cell_ids,
@@ -523,18 +521,29 @@ def build_backend_plan(
                 "module_names": module_names,
                 "rank_pattern": rank_pattern,
                 "alpha_pattern": alpha_pattern,
-                "has_trainable_params": bool(timestep_band_metadata[timestep_band]["has_trainable_params"]),
-                "noop": bool(timestep_band_metadata[timestep_band]["noop"]),
+                "has_trainable_params": True,
+                "noop": False,
             }
             if backend == "timestep_only":
                 bank["rank"] = _single_value(band_cells, "rank", backend=backend, scope=timestep_band)
                 bank["alpha"] = _single_value(band_cells, "alpha", backend=backend, scope=timestep_band)
             adapter_banks.append(bank)
-        routing_table = build_adapter_routing_table(timestep_band_routes, band_to_adapter=band_to_adapter)
+        routing_table = _build_timestep_band_routing_table(
+            timestep_band_routes,
+            band_to_adapter=band_to_adapter,
+            timestep_band_metadata=timestep_band_metadata,
+        )
         routing = {
             "mode": "timestep_band",
             "table": routing_table,
-            "summary": describe_routing_table(routing_table),
+            "summary": {
+                "timestep_bands": list(routing_table),
+                "mapped_timestep_total": sum(len(route["step_indices"]) for route in routing_table.values()),
+                "adapter_names": {
+                    str(band_name): route["adapter_name"]
+                    for band_name, route in routing_table.items()
+                },
+            },
         }
 
     else:
@@ -568,6 +577,34 @@ def _mode_int(values: Sequence[int], *, context: str) -> int:
     return int(Counter(normalized).most_common(1)[0][0])
 
 
+def _build_timestep_band_routing_table(
+    routes: Mapping[str, Mapping[str, Sequence[int]]],
+    *,
+    band_to_adapter: Mapping[str, str],
+    timestep_band_metadata: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    table: dict[str, dict[str, Any]] = {}
+    for band_name, route in routes.items():
+        normalized_band_name = str(band_name)
+        if normalized_band_name not in timestep_band_metadata:
+            raise AdapterFactoryError(f"Missing timestep-band metadata for {normalized_band_name!r}")
+        noop = bool(timestep_band_metadata[normalized_band_name]["noop"])
+        adapter_name: str | None
+        if noop:
+            adapter_name = None
+        else:
+            adapter_name = str(band_to_adapter.get(normalized_band_name, "")).strip()
+            if not adapter_name:
+                raise AdapterFactoryError(f"Missing adapter_name for trainable timestep_band {normalized_band_name!r}")
+        table[normalized_band_name] = {
+            "adapter_name": adapter_name,
+            "noop": noop,
+            "step_indices": [int(value) for value in route["step_indices"]],
+            "timestep_values": [int(value) for value in route["timestep_values"]],
+        }
+    return table
+
+
 def build_concrete_adapter_specs(
     plan: Mapping[str, Any],
     *,
@@ -596,19 +633,6 @@ def build_concrete_adapter_specs(
             if int(rank) > 0
         )
         if not positive_modules:
-            concrete_specs.append(
-                {
-                    "adapter_name": str(bank["adapter_name"]),
-                    "timestep_band": bank["timestep_band"],
-                    "cell_ids": list(bank["cell_ids"]),
-                    "target_modules": [],
-                    "rank": 0,
-                    "alpha": 0,
-                    "rank_pattern": {},
-                    "alpha_pattern": {},
-                    "noop": True,
-                }
-            )
             continue
 
         rank = _mode_int(

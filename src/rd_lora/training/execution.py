@@ -376,8 +376,9 @@ def apply_adapter_specs(
     adapter_specs: Sequence[Mapping[str, Any]],
     use_rslora: bool,
     lora_dropout: float,
-) -> None:
+) -> list[str]:
     created_any = False
+    created_adapter_names: list[str] = []
     for spec in adapter_specs:
         if bool(spec["noop"]):
             continue
@@ -392,14 +393,34 @@ def apply_adapter_specs(
             use_rslora=bool(use_rslora),
         )
         unet.add_adapter(adapter_config, adapter_name=str(spec["adapter_name"]))
+        created_adapter_names.append(str(spec["adapter_name"]))
         created_any = True
 
     if not created_any:
         raise TrainingExecutionError("Adapter construction produced no trainable LoRA banks")
+    return created_adapter_names
 
 
-def collect_trainable_parameters(unet: Any) -> list[Any]:
-    trainable = [parameter for parameter in unet.parameters() if bool(getattr(parameter, "requires_grad", False))]
+def assert_adapter_param_counts(unet: Any, adapter_names: list[str] | None) -> None:
+    if not adapter_names:
+        return
+    for adapter_name in adapter_names:
+        count = sum(p.numel() for n, p in unet.named_parameters() if adapter_name in n)
+        if count == 0:
+            raise TrainingExecutionError(
+                f"Adapter {adapter_name!r} has zero parameters; bad rank_pattern/target mapping"
+            )
+
+
+def collect_trainable_parameters(unet: Any, adapter_names: Sequence[str] | None = None) -> list[Any]:
+    if adapter_names is not None and len(adapter_names) > 0:
+        trainable = [
+            param
+            for name, param in unet.named_parameters()
+            if any(adapter_name in name for adapter_name in adapter_names)
+        ]
+    else:
+        trainable = [parameter for parameter in unet.parameters() if bool(getattr(parameter, "requires_grad", False))]
     if not trainable:
         raise TrainingExecutionError("No trainable LoRA parameters were found after adapter construction")
     return trainable
@@ -589,7 +610,7 @@ def _assert_optimizer_parameter_coverage(
     *,
     trainable_parameters: Sequence[Any],
     optimizer: Any,
-) -> None:
+) -> list[str]:
     optimizer_parameters = _optimizer_parameters(optimizer)
     optimizer_counts: dict[int, int] = {}
     for parameter in optimizer_parameters:
@@ -922,7 +943,7 @@ def write_success_artifacts(
     train_summary: Mapping[str, Any],
     metrics: Mapping[str, Any],
     checkpoint_info: Mapping[str, Any],
-) -> None:
+) -> list[str]:
     assert_real_gpu_training_provenance(run_provenance)
     if str(train_summary.get("status")) != TRAINING_SUCCESS_STATUS:
         raise TrainingExecutionError(
@@ -1090,19 +1111,20 @@ def execute_training_run(
         components=components,
     )
     adapter_specs = build_concrete_adapter_specs(plan, unet=components["unet"])
-    apply_adapter_specs(
+    created_adapter_names = apply_adapter_specs(
         official_module=official_module,
         unet=components["unet"],
         adapter_specs=adapter_specs,
         use_rslora=bool(plan["use_rslora"]),
         lora_dropout=float(training_args.lora_dropout),
     )
+    assert_adapter_param_counts(components["unet"], created_adapter_names)
     adapter_spec_by_name = _adapter_spec_lookup(adapter_specs)
     _assert_no_noop_adapter_specs(adapter_spec_by_name)
     if training_args.mixed_precision == "fp16":
         official_module.cast_training_params([components["unet"]], dtype=torch_module.float32)
 
-    trainable_parameters = collect_trainable_parameters(components["unet"])
+    trainable_parameters = collect_trainable_parameters(components["unet"], adapter_names=created_adapter_names)
     optimizer = create_optimizer(
         torch_module=torch_module,
         trainable_parameters=trainable_parameters,
@@ -1323,6 +1345,7 @@ __all__ = [
     "TRAINING_SUCCESS_STATUS",
     "TrainingExecutionError",
     "build_training_args",
+    "assert_adapter_param_counts",
     "collect_trainable_parameters",
     "build_run_provenance_payload",
     "create_accelerator",

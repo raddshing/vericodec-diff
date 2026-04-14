@@ -556,12 +556,14 @@ def select_active_adapter_name(
     plan: Mapping[str, Any],
     timesteps: Sequence[int],
     num_train_timesteps: int,
+    active_timestep_band: str | None = None,
 ) -> str:
-    active_timestep_band = select_active_timestep_band_name(
-        plan=plan,
-        timesteps=timesteps,
-        num_train_timesteps=num_train_timesteps,
-    )
+    if active_timestep_band is None:
+        active_timestep_band = select_active_timestep_band_name(
+            plan=plan,
+            timesteps=timesteps,
+            num_train_timesteps=num_train_timesteps,
+        )
     routing = dict(plan["routing"])
     if routing["mode"] == "static":
         adapter_name = str(routing["default_adapter_name"])
@@ -588,6 +590,70 @@ def select_active_timestep_band_name(
         )
     except TimestepRoutingError as exc:
         raise TrainingExecutionError(f"Timestep routing failed: {exc}") from exc
+
+
+def _sample_timestep_band_training_timesteps(
+    *,
+    torch_module: Any,
+    noise_scheduler: Any,
+    batch: Mapping[str, Any],
+) -> Any:
+    pixel_values = batch.get("pixel_values")
+    if pixel_values is None:
+        raise TrainingExecutionError("batch must include pixel_values for timestep-band routing")
+    shape = getattr(pixel_values, "shape", None)
+    if shape is None or len(shape) < 1:
+        raise TrainingExecutionError("batch.pixel_values must expose a batch dimension for timestep-band routing")
+    batch_size = int(shape[0])
+    if batch_size <= 0:
+        raise TrainingExecutionError("batch.pixel_values must include at least one example")
+    randint_kwargs: dict[str, Any] = {}
+    device = getattr(pixel_values, "device", None)
+    if device is not None:
+        randint_kwargs["device"] = device
+    return torch_module.randint(
+        0,
+        int(noise_scheduler.config.num_train_timesteps),
+        (batch_size,),
+        **randint_kwargs,
+    ).long()
+
+
+def _plan_timestep_band_batch_route(
+    *,
+    torch_module: Any,
+    plan: Mapping[str, Any],
+    components: Mapping[str, Any],
+    batch: Mapping[str, Any],
+    timestep_band_metadata: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    noise_scheduler = components["scheduler"]
+    timesteps = _sample_timestep_band_training_timesteps(
+        torch_module=torch_module,
+        noise_scheduler=noise_scheduler,
+        batch=batch,
+    )
+    timestep_values = [int(value) for value in timesteps.detach().flatten().tolist()]
+    active_timestep_band = select_active_timestep_band_name(
+        plan=plan,
+        timesteps=timestep_values,
+        num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
+    )
+    active_adapter_name = select_active_adapter_name(
+        plan=plan,
+        timesteps=timestep_values,
+        num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
+        active_timestep_band=active_timestep_band,
+    )
+    if active_timestep_band not in timestep_band_metadata:
+        raise TrainingExecutionError(f"Unknown routed timestep band {active_timestep_band!r}")
+    routed_timestep_band = dict(timestep_band_metadata[active_timestep_band])
+    return {
+        "timesteps": timesteps,
+        "active_timestep_band": active_timestep_band,
+        "active_adapter_name": active_adapter_name,
+        "noop": bool(routed_timestep_band["noop"]),
+    }
 
 
 def _resolve_routed_timestep_band_metadata(
@@ -651,6 +717,9 @@ def compute_step_loss(
     components: Mapping[str, Any],
     runtime_state: Mapping[str, Any],
     batch: Mapping[str, Any],
+    timesteps: Any | None = None,
+    active_timestep_band: str | None = None,
+    active_adapter_name: str | None = None,
 ) -> tuple[Any, str]:
     vae = components["vae"]
     unet = components["unet"]
@@ -671,26 +740,38 @@ def compute_step_loss(
 
     noise = torch_module.randn_like(model_input)
     batch_size = model_input.shape[0]
-    timesteps = torch_module.randint(
-        0,
-        int(noise_scheduler.config.num_train_timesteps),
-        (batch_size,),
-        device=model_input.device,
-    ).long()
+    route_was_precomputed = active_timestep_band is not None and active_adapter_name is not None
+    if timesteps is None:
+        timesteps = torch_module.randint(
+            0,
+            int(noise_scheduler.config.num_train_timesteps),
+            (batch_size,),
+            device=model_input.device,
+        ).long()
+    else:
+        timesteps = timesteps.to(device=model_input.device).long()
 
-    timestep_values = [int(value) for value in timesteps.detach().flatten().tolist()]
-    active_timestep_band = select_active_timestep_band_name(
-        plan=plan,
-        timesteps=timestep_values,
-        num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
-    )
-    active_adapter_name = select_active_adapter_name(
-        plan=plan,
-        timesteps=timestep_values,
-        num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
-    )
-    _set_active_timestep_band_marker(unet, active_timestep_band)
-    _activate_adapter(unet, adapter_name=active_adapter_name, adapter_spec_by_name=adapter_spec_by_name)
+    timestep_values: list[int] | None = None
+    if active_timestep_band is None or active_adapter_name is None:
+        timestep_values = [int(value) for value in timesteps.detach().flatten().tolist()]
+    if active_timestep_band is None:
+        assert timestep_values is not None
+        active_timestep_band = select_active_timestep_band_name(
+            plan=plan,
+            timesteps=timestep_values,
+            num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
+        )
+    if active_adapter_name is None:
+        assert timestep_values is not None
+        active_adapter_name = select_active_adapter_name(
+            plan=plan,
+            timesteps=timestep_values,
+            num_train_timesteps=int(noise_scheduler.config.num_train_timesteps),
+            active_timestep_band=active_timestep_band,
+        )
+    if not route_was_precomputed:
+        _set_active_timestep_band_marker(unet, active_timestep_band)
+        _activate_adapter(unet, adapter_name=active_adapter_name, adapter_spec_by_name=adapter_spec_by_name)
 
     noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
     prompt_embeds, pooled_prompt_embeds = official_module.encode_prompt(
@@ -1002,6 +1083,7 @@ def execute_training_run(
     last_checkpoint_path: Path | None = None
     last_active_adapter_name = static_adapter_name
     max_train_steps = int(training_args.max_train_steps)
+    routing_mode = str(dict(plan["routing"]).get("mode", ""))
 
     while global_step < max_train_steps:
         components["unet"].train()
@@ -1009,9 +1091,34 @@ def execute_training_run(
         for batch in train_dataloader:
             batches_in_epoch += 1
             total_batches_processed += 1
-            skip_noop_batch = False
+            loss: Any | None = None
+            optimizer_step_completed = False
+            step_timesteps: Any | None = None
+            active_timestep_band: str | None = None
+            active_adapter_name_for_step: str | None = None
+            _set_active_timestep_band_marker(components["unet"], None)
+            if routing_mode == "timestep_band":
+                step_route = _plan_timestep_band_batch_route(
+                    torch_module=torch_module,
+                    plan=plan,
+                    components=components,
+                    batch=batch,
+                    timestep_band_metadata=timestep_band_metadata,
+                )
+                step_timesteps = step_route["timesteps"]
+                active_timestep_band = str(step_route["active_timestep_band"])
+                active_adapter_name_for_step = str(step_route["active_adapter_name"])
+                last_active_adapter_name = active_adapter_name_for_step
+                _set_active_timestep_band_marker(components["unet"], active_timestep_band)
+                _activate_adapter(
+                    components["unet"],
+                    adapter_name=active_adapter_name_for_step,
+                    adapter_spec_by_name=adapter_spec_by_name,
+                )
+                if bool(step_route["noop"]):
+                    skipped_noop_band_batches += 1
+                    continue
             with accelerator.accumulate(components["unet"]) if hasattr(accelerator, "accumulate") else nullcontext():
-                _set_active_timestep_band_marker(components["unet"], None)
                 loss, last_active_adapter_name = compute_step_loss(
                     torch_module=torch_module,
                     official_module=official_module,
@@ -1022,27 +1129,21 @@ def execute_training_run(
                     components=components,
                     runtime_state=runtime_state,
                     batch=batch,
+                    timesteps=step_timesteps,
+                    active_timestep_band=active_timestep_band,
+                    active_adapter_name=active_adapter_name_for_step,
                 )
-                routed_timestep_band = _resolve_routed_timestep_band_metadata(
-                    plan=plan,
-                    unet=components["unet"],
-                    active_adapter_name=last_active_adapter_name,
-                    timestep_band_metadata=timestep_band_metadata,
-                )
-                skip_noop_batch = bool(routed_timestep_band["noop"])
-                if not skip_noop_batch:
-                    optimizer.zero_grad()
-                    accelerator.backward(loss)
-                    if getattr(accelerator, "sync_gradients", True) and hasattr(accelerator, "clip_grad_norm_"):
-                        accelerator.clip_grad_norm_(trainable_parameters, training_args.max_grad_norm)
-                    optimizer.step()
-                    if lr_scheduler is not None:
-                        lr_scheduler.step()
+                accelerator.backward(loss)
+                if getattr(accelerator, "sync_gradients", True) and hasattr(accelerator, "clip_grad_norm_"):
+                    accelerator.clip_grad_norm_(trainable_parameters, training_args.max_grad_norm)
+                optimizer.step()
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
+                optimizer.zero_grad()
+                optimizer_step_completed = bool(getattr(accelerator, "sync_gradients", True))
 
-            if skip_noop_batch:
-                skipped_noop_band_batches += 1
-                continue
-            if getattr(accelerator, "sync_gradients", True):
+            if optimizer_step_completed:
+                assert loss is not None
                 global_step += 1
                 loss_value = float(loss.detach().item())
                 recorded_losses.append(loss_value)

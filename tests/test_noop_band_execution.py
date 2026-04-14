@@ -55,6 +55,9 @@ class FakeModel:
         self._parameters = [FakeParam(requires_grad=False) for _ in range(parameter_count)]
         self.active_adapter = ""
         self.adapters_enabled = True
+        self.set_adapter_calls: list[str] = []
+        self.enable_adapter_calls = 0
+        self.disable_adapter_calls = 0
 
     def parameters(self):  # noqa: ANN201
         return list(self._parameters)
@@ -76,12 +79,15 @@ class FakeModel:
 
     def set_adapter(self, adapter_name: str) -> None:
         self.active_adapter = adapter_name
+        self.set_adapter_calls.append(adapter_name)
 
     def enable_adapters(self) -> None:
         self.adapters_enabled = True
+        self.enable_adapter_calls += 1
 
     def disable_adapters(self) -> None:
         self.adapters_enabled = False
+        self.disable_adapter_calls += 1
 
 
 class FakeLoss:
@@ -128,11 +134,21 @@ class FakeAccelerator:
         self.is_main_process = True
         self.backward_calls: list[FakeLoss] = []
         self.logged_steps: list[int] = []
+        self.accumulate_calls = 0
+        self.accumulate_entry_adapters: list[str] = []
+        self.accumulate_entry_adapter_states: list[bool] = []
+        self.accumulate_entry_timestep_bands: list[str] = []
+        self.planned_route_bands: list[str] = []
+        self.loss_route_bands: list[str] = []
 
     def prepare(self, *items):  # noqa: ANN002
         return items
 
-    def accumulate(self, _model):  # noqa: ANN001
+    def accumulate(self, model):  # noqa: ANN001
+        self.accumulate_calls += 1
+        self.accumulate_entry_adapters.append(str(getattr(model, "active_adapter", "")))
+        self.accumulate_entry_adapter_states.append(bool(getattr(model, "adapters_enabled", True)))
+        self.accumulate_entry_timestep_bands.append(str(getattr(model, "_rd_lora_active_timestep_band", "")))
         return nullcontext()
 
     def backward(self, loss: FakeLoss) -> None:
@@ -250,7 +266,7 @@ def _run_training_scenario(
     *,
     routed_bands: list[str],
     max_train_steps: int,
-) -> tuple[dict[str, object], FakeAccelerator, FakeOptimizer, FakeScheduler]:
+) -> tuple[dict[str, object], FakeAccelerator, FakeOptimizer, FakeScheduler, FakeModel]:
     plan = build_backend_adapter_plan(
         "timestep_only",
         _timestep_only_manifest(zero_rank_bands={"timestep_band_00"}),
@@ -305,15 +321,29 @@ def _run_training_scenario(
     monkeypatch.setattr(execution, "create_optimizer", fake_create_optimizer)
     monkeypatch.setattr(execution, "create_lr_scheduler", lambda **_kwargs: fake_scheduler)
 
-    def fake_compute_step_loss(**kwargs):  # noqa: ANN003
+    def fake_plan_timestep_band_batch_route(**kwargs):  # noqa: ANN003
         try:
             timestep_band = next(schedule)
         except StopIteration as exc:
-            raise AssertionError("compute_step_loss called more times than expected") from exc
+            raise AssertionError("timestep-band route planning called more times than expected") from exc
+        fake_accelerator.planned_route_bands.append(timestep_band)
         adapter_name = kwargs["plan"]["routing"]["table"][timestep_band]["adapter_name"]
-        kwargs["components"]["unet"].set_adapter(adapter_name)
-        kwargs["components"]["unet"]._rd_lora_active_timestep_band = timestep_band
-        return FakeLoss(1.0 if timestep_band == "timestep_band_00" else 2.0), adapter_name
+        return {
+            "timesteps": object(),
+            "active_timestep_band": timestep_band,
+            "active_adapter_name": adapter_name,
+            "noop": bool(kwargs["timestep_band_metadata"][timestep_band]["noop"]),
+        }
+
+    monkeypatch.setattr(execution, "_plan_timestep_band_batch_route", fake_plan_timestep_band_batch_route)
+
+    def fake_compute_step_loss(**kwargs):  # noqa: ANN003
+        timestep_band = str(kwargs["active_timestep_band"])
+        fake_accelerator.loss_route_bands.append(timestep_band)
+        adapter_name = str(kwargs["active_adapter_name"])
+        assert kwargs["timesteps"] is not None
+        assert adapter_name == kwargs["plan"]["routing"]["table"][timestep_band]["adapter_name"]
+        return FakeLoss(2.0), adapter_name
 
     monkeypatch.setattr(execution, "compute_step_loss", fake_compute_step_loss)
     monkeypatch.setattr(execution, "build_run_provenance_payload", lambda **_kwargs: _provenance(tmp_path))
@@ -334,7 +364,7 @@ def _run_training_scenario(
         output_dir=tmp_path,
         run_mode="real_gpu",
     )
-    return result, fake_accelerator, optimizer_holder["optimizer"], fake_scheduler
+    return result, fake_accelerator, optimizer_holder["optimizer"], fake_scheduler, fake_unet
 
 
 def test_backend_plan_exposes_noop_timestep_band_metadata() -> None:
@@ -350,7 +380,7 @@ def test_backend_plan_exposes_noop_timestep_band_metadata() -> None:
 
 
 def test_zero_rank_timestep_band_does_not_call_backward_or_step(monkeypatch, tmp_path: Path) -> None:
-    result, accelerator, optimizer, scheduler = _run_training_scenario(
+    result, accelerator, optimizer, scheduler, unet = _run_training_scenario(
         monkeypatch,
         tmp_path,
         routed_bands=["timestep_band_00", "timestep_band_01"],
@@ -359,8 +389,17 @@ def test_zero_rank_timestep_band_does_not_call_backward_or_step(monkeypatch, tmp
 
     metrics = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
     assert len(accelerator.backward_calls) == 1
+    assert accelerator.accumulate_calls == 1
+    assert accelerator.planned_route_bands == ["timestep_band_00", "timestep_band_01"]
+    assert accelerator.loss_route_bands == ["timestep_band_01"]
+    assert accelerator.accumulate_entry_timestep_bands == ["timestep_band_01"]
+    assert accelerator.accumulate_entry_adapter_states == [True]
     assert optimizer.step_calls == 1
+    assert optimizer.zero_grad_calls == 1
     assert scheduler.step_calls == 1
+    assert unet.disable_adapter_calls == 1
+    assert unet.enable_adapter_calls == 1
+    assert unet.set_adapter_calls == ["timestep_only_timestep_band_01"]
     assert metrics["skipped_noop_band_batches"] == 1
     assert metrics["skipped_noop_band_fraction"] == 0.5
     assert metrics["active_band_optimizer_steps"] == metrics["global_step"] == 1
@@ -368,7 +407,7 @@ def test_zero_rank_timestep_band_does_not_call_backward_or_step(monkeypatch, tmp
 
 
 def test_trainable_band_still_calls_backward_and_step(monkeypatch, tmp_path: Path) -> None:
-    result, accelerator, optimizer, scheduler = _run_training_scenario(
+    result, accelerator, optimizer, scheduler, unet = _run_training_scenario(
         monkeypatch,
         tmp_path,
         routed_bands=["timestep_band_01"],
@@ -376,14 +415,20 @@ def test_trainable_band_still_calls_backward_and_step(monkeypatch, tmp_path: Pat
     )
 
     assert len(accelerator.backward_calls) == 1
+    assert accelerator.accumulate_calls == 1
+    assert accelerator.planned_route_bands == ["timestep_band_01"]
+    assert accelerator.loss_route_bands == ["timestep_band_01"]
     assert optimizer.step_calls == 1
+    assert optimizer.zero_grad_calls == 1
     assert scheduler.step_calls == 1
+    assert unet.disable_adapter_calls == 0
+    assert unet.enable_adapter_calls == 1
     assert result["metrics"]["skipped_noop_band_batches"] == 0
     assert result["metrics"]["active_band_optimizer_steps"] == 1
 
 
 def test_global_step_counts_only_optimizer_steps_not_raw_batches(monkeypatch, tmp_path: Path) -> None:
-    result, accelerator, optimizer, scheduler = _run_training_scenario(
+    result, accelerator, optimizer, scheduler, unet = _run_training_scenario(
         monkeypatch,
         tmp_path,
         routed_bands=[
@@ -395,10 +440,20 @@ def test_global_step_counts_only_optimizer_steps_not_raw_batches(monkeypatch, tm
         max_train_steps=2,
     )
 
-    assert optimizer.zero_grad_calls == 4
+    assert accelerator.accumulate_calls == 2
+    assert accelerator.planned_route_bands == [
+        "timestep_band_00",
+        "timestep_band_01",
+        "timestep_band_00",
+        "timestep_band_01",
+    ]
+    assert accelerator.loss_route_bands == ["timestep_band_01", "timestep_band_01"]
+    assert optimizer.zero_grad_calls == 2
     assert len(accelerator.backward_calls) == 2
     assert optimizer.step_calls == 2
     assert scheduler.step_calls == 2
+    assert unet.disable_adapter_calls == 2
+    assert unet.enable_adapter_calls == 2
     assert accelerator.logged_steps == [1, 2]
     assert result["metrics"]["global_step"] == 2
     assert result["metrics"]["active_band_optimizer_steps"] == 2

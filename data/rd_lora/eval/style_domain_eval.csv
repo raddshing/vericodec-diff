@@ -1,0 +1,33 @@
+prompt_id,task,prompt,seed,expected_text
+sign_01,style_domain,"A wooden shop sign that reads ""OPEN DAILY""",42,OPEN DAILY
+sign_01,style_domain,"A wooden shop sign that reads ""OPEN DAILY""",123,OPEN DAILY
+sign_02,style_domain,"A neon cafe sign displaying ""MIDNIGHT COFFEE""",42,MIDNIGHT COFFEE
+sign_02,style_domain,"A neon cafe sign displaying ""MIDNIGHT COFFEE""",123,MIDNIGHT COFFEE
+sign_03,style_domain,"A metal street sign saying ""NO PARKING""",42,NO PARKING
+sign_03,style_domain,"A metal street sign saying ""NO PARKING""",123,NO PARKING
+sign_04,style_domain,"A chalkboard bakery sign with the words ""FRESH BREAD""",42,FRESH BREAD
+sign_04,style_domain,"A chalkboard bakery sign with the words ""FRESH BREAD""",123,FRESH BREAD
+sign_05,style_domain,"A marquee theater sign reading ""TONIGHT ONLY""",42,TONIGHT ONLY
+sign_05,style_domain,"A marquee theater sign reading ""TONIGHT ONLY""",123,TONIGHT ONLY
+sign_06,style_domain,"A roadside motel sign showing ""VACANCY""",42,VACANCY
+sign_06,style_domain,"A roadside motel sign showing ""VACANCY""",123,VACANCY
+sign_07,style_domain,"A hanging bookstore sign that says ""RARE BOOKS""",42,RARE BOOKS
+sign_07,style_domain,"A hanging bookstore sign that says ""RARE BOOKS""",123,RARE BOOKS
+sign_08,style_domain,"A glossy trade show banner reading ""WELCOME VISITORS""",42,WELCOME VISITORS
+sign_08,style_domain,"A glossy trade show banner reading ""WELCOME VISITORS""",123,WELCOME VISITORS
+sign_09,style_domain,"A retro arcade sign displaying ""INSERT COIN""",42,INSERT COIN
+sign_09,style_domain,"A retro arcade sign displaying ""INSERT COIN""",123,INSERT COIN
+sign_10,style_domain,"An airport terminal sign that reads ""GATE 12""",42,GATE 12
+sign_10,style_domain,"An airport terminal sign that reads ""GATE 12""",123,GATE 12
+sign_11,style_domain,"A farmers market stall sign saying ""LOCAL HONEY""",42,LOCAL HONEY
+sign_11,style_domain,"A farmers market stall sign saying ""LOCAL HONEY""",123,LOCAL HONEY
+sign_12,style_domain,"A museum placard with the text ""DO NOT TOUCH""",42,DO NOT TOUCH
+sign_12,style_domain,"A museum placard with the text ""DO NOT TOUCH""",123,DO NOT TOUCH
+sign_13,style_domain,"A construction warning sign reading ""DETOUR AHEAD""",42,DETOUR AHEAD
+sign_13,style_domain,"A construction warning sign reading ""DETOUR AHEAD""",123,DETOUR AHEAD
+sign_14,style_domain,"A subway platform sign displaying ""DOWNTOWN EXPRESS""",42,DOWNTOWN EXPRESS
+sign_14,style_domain,"A subway platform sign displaying ""DOWNTOWN EXPRESS""",123,DOWNTOWN EXPRESS
+sign_15,style_domain,"An illuminated pharmacy sign that says ""OPEN 24 HOURS""",42,OPEN 24 HOURS
+sign_15,style_domain,"An illuminated pharmacy sign that says ""OPEN 24 HOURS""",123,OPEN 24 HOURS
+sign_16,style_domain,"A hand-painted festival sign reading ""SUMMER FAIR""",42,SUMMER FAIR
+sign_16,style_domain,"A hand-painted festival sign reading ""SUMMER FAIR""",123,SUMMER FAIR

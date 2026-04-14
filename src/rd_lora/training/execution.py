@@ -26,6 +26,7 @@ from rd_lora.training.adapter_factory import (
 from rd_lora.training.timestep_routing import (
     TimestepRoutingError,
     build_timestep_band_routes,
+    resolve_deterministic_timestep_for_band,
     resolve_timestep_band_name_for_training_timesteps,
 )
 
@@ -539,6 +540,27 @@ def _plan_timestep_band_metadata(plan: Mapping[str, Any]) -> dict[str, dict[str,
     return _synthesize_timestep_band_metadata(plan)
 
 
+def _normalize_forced_timestep_band_sequence(
+    value: Sequence[str] | None,
+) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        raise TrainingExecutionError("forced_timestep_band_sequence must be a sequence of band names")
+
+    normalized: list[str] = []
+    for index, raw_band_name in enumerate(value):
+        band_name = str(raw_band_name).strip()
+        if not band_name:
+            raise TrainingExecutionError(
+                f"forced_timestep_band_sequence[{index}] must be a non-empty band name"
+            )
+        normalized.append(band_name)
+    if not normalized:
+        raise TrainingExecutionError("forced_timestep_band_sequence must not be empty")
+    return normalized
+
+
 def _set_active_timestep_band_marker(unet: Any, timestep_band: str | None) -> None:
     try:
         setattr(unet, "_rd_lora_active_timestep_band", "" if timestep_band is None else str(timestep_band))
@@ -705,13 +727,39 @@ def _plan_timestep_band_batch_route(
     components: Mapping[str, Any],
     batch: Mapping[str, Any],
     timestep_band_metadata: Mapping[str, Mapping[str, Any]],
+    forced_timestep: int | None = None,
 ) -> dict[str, Any]:
     noise_scheduler = components["scheduler"]
-    timesteps = _sample_timestep_band_training_timesteps(
-        torch_module=torch_module,
-        noise_scheduler=noise_scheduler,
-        batch=batch,
-    )
+    if forced_timestep is None:
+        timesteps = _sample_timestep_band_training_timesteps(
+            torch_module=torch_module,
+            noise_scheduler=noise_scheduler,
+            batch=batch,
+        )
+    else:
+        pixel_values = batch.get("pixel_values")
+        if pixel_values is None:
+            raise TrainingExecutionError(
+                "batch must include pixel_values for forced timestep-band routing"
+            )
+        shape = getattr(pixel_values, "shape", None)
+        if shape is None or len(shape) < 1:
+            raise TrainingExecutionError(
+                "batch.pixel_values must expose a batch dimension for forced timestep-band routing"
+            )
+        batch_size = int(shape[0])
+        if batch_size <= 0:
+            raise TrainingExecutionError("batch.pixel_values must include at least one example")
+        full_kwargs: dict[str, Any] = {}
+        device = getattr(pixel_values, "device", None)
+        if device is not None:
+            full_kwargs["device"] = device
+        long_dtype = getattr(torch_module, "long", None)
+        if long_dtype is not None:
+            full_kwargs["dtype"] = long_dtype
+        timesteps = torch_module.full((batch_size,), int(forced_timestep), **full_kwargs)
+        if hasattr(timesteps, "long"):
+            timesteps = timesteps.long()
     timestep_values = [int(value) for value in timesteps.detach().flatten().tolist()]
     active_timestep_band = select_active_timestep_band_name(
         plan=plan,
@@ -1059,6 +1107,7 @@ def execute_training_run(
     allocation_path: str | Path,
     output_dir: str | Path,
     run_mode: str,
+    forced_timestep_band_sequence: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     if str(run_mode) != "real_gpu":
         raise TrainingExecutionError("run_mode must be 'real_gpu'")
@@ -1154,7 +1203,16 @@ def execute_training_run(
         lr_scheduler,
     )
     timestep_band_metadata = _plan_timestep_band_metadata(plan)
+    routing_table = _plan_timestep_band_routes(plan)
     static_adapter_name = _normalize_optional_adapter_name(dict(plan["routing"]).get("default_adapter_name"))
+    requested_forced_timestep_band_sequence = (
+        forced_timestep_band_sequence
+        if forced_timestep_band_sequence is not None
+        else plan.get("forced_timestep_band_sequence")
+    )
+    normalized_forced_timestep_band_sequence = _normalize_forced_timestep_band_sequence(
+        requested_forced_timestep_band_sequence
+    )
     if dict(plan["routing"])["mode"] == "static":
         if static_adapter_name is None:
             raise TrainingExecutionError("Static routing requires a concrete default_adapter_name")
@@ -1175,11 +1233,34 @@ def execute_training_run(
     last_active_adapter_name = static_adapter_name
     max_train_steps = int(training_args.max_train_steps)
     routing_mode = str(dict(plan["routing"]).get("mode", ""))
+    if normalized_forced_timestep_band_sequence is not None and routing_mode != "timestep_band":
+        raise TrainingExecutionError(
+            "forced_timestep_band_sequence requires plan.routing.mode='timestep_band'"
+        )
+    forced_timestep_band_index = 0
+    forced_timestep_band_sequence_exhausted = False
 
-    while global_step < max_train_steps:
+    while normalized_forced_timestep_band_sequence is not None or global_step < max_train_steps:
         components["unet"].train()
         batches_in_epoch = 0
         for batch in train_dataloader:
+            forced_timestep: int | None = None
+            if normalized_forced_timestep_band_sequence is not None:
+                if forced_timestep_band_index >= len(normalized_forced_timestep_band_sequence):
+                    forced_timestep_band_sequence_exhausted = True
+                    break
+                forced_timestep_band_name = normalized_forced_timestep_band_sequence[
+                    forced_timestep_band_index
+                ]
+                forced_timestep_band_index += 1
+                try:
+                    forced_timestep = resolve_deterministic_timestep_for_band(
+                        routing_table,
+                        forced_timestep_band_name,
+                        num_train_timesteps=int(components["scheduler"].config.num_train_timesteps),
+                    )
+                except TimestepRoutingError as exc:
+                    raise TrainingExecutionError(f"Forced timestep routing failed: {exc}") from exc
             batches_in_epoch += 1
             total_batches_processed += 1
             loss: Any | None = None
@@ -1195,6 +1276,7 @@ def execute_training_run(
                     components=components,
                     batch=batch,
                     timestep_band_metadata=timestep_band_metadata,
+                    forced_timestep=forced_timestep,
                 )
                 step_timesteps = route["timesteps"]
                 active_timestep_band = str(route["active_timestep_band"])
@@ -1269,8 +1351,10 @@ def execute_training_run(
                         output_dir=output_dir_path,
                         global_step=global_step,
                     )
-            if global_step >= max_train_steps:
+            if normalized_forced_timestep_band_sequence is None and global_step >= max_train_steps:
                 break
+        if forced_timestep_band_sequence_exhausted:
+            break
         if batches_in_epoch <= 0:
             raise TrainingExecutionError("train_dataloader must yield at least one batch")
 

@@ -19,6 +19,18 @@ from vericodec_diff.config import OmegaConf
 DEFAULT_CONFIG_PATH = "configs/rdlora_gate.yaml"
 
 
+def _parse_forced_timestep_band_sequence(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+
+    bands = [segment.strip() for segment in str(value).split(",")]
+    if any(not band for band in bands):
+        raise argparse.ArgumentTypeError(
+            "--forced_timestep_band_sequence must be a comma-separated list of non-empty band names"
+        )
+    return bands or None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Execute real SDXL DreamBooth LoRA training for the RD-LoRA backends."
@@ -29,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allocation", required=True, help="Allocation manifest JSON path.")
     parser.add_argument("--run_mode", choices=("real_gpu",), required=True)
     parser.add_argument("--output_dir", required=True, help="Output directory for the run artifacts.")
+    parser.add_argument(
+        "--forced_timestep_band_sequence",
+        type=_parse_forced_timestep_band_sequence,
+        default=None,
+        help="Optional comma-separated timestep-band sequence for deterministic smoke routing.",
+    )
     return parser.parse_args()
 
 
@@ -121,6 +139,9 @@ def main() -> int:
             "task": args.task,
             "backend": args.backend,
             "run_mode": args.run_mode,
+            "training": {
+                "forced_timestep_band_sequence": args.forced_timestep_band_sequence,
+            },
             "paths": {
                 "repo_root": str(REPO_ROOT),
                 "output_dir": str(output_dir),
@@ -139,6 +160,7 @@ def main() -> int:
         allocation_path=args.allocation,
         output_dir=output_dir,
         run_mode=args.run_mode,
+        forced_timestep_band_sequence=args.forced_timestep_band_sequence,
     )
     print(f"resolved_config={resolved_config_path}")
     print(f"backend={args.backend}")

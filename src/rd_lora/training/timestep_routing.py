@@ -124,6 +124,42 @@ def project_training_timestep_to_step_index(
     return max(0, min(reference_step_count - 1, projected))
 
 
+def resolve_deterministic_timestep_for_band(
+    routing_table: Mapping[str, Mapping[str, Sequence[int]]],
+    band_name: str,
+    *,
+    num_train_timesteps: int = 1000,
+    reference_step_count: int = 20,
+) -> int:
+    normalized_band_name = str(band_name).strip()
+    if normalized_band_name not in routing_table:
+        raise TimestepRoutingError(
+            f"Unknown timestep band {normalized_band_name!r}; available={sorted(str(name) for name in routing_table)}"
+        )
+
+    step_indices = [int(value) for value in routing_table[normalized_band_name].get("step_indices", ())]
+    if not step_indices:
+        raise TimestepRoutingError(f"Routing entry for {normalized_band_name!r} must expose step_indices")
+
+    target_step_index = step_indices[len(step_indices) // 2]
+    max_timestep = max(1, int(num_train_timesteps) - 1)
+    matching_timesteps = [
+        timestep_value
+        for timestep_value in range(max_timestep + 1)
+        if project_training_timestep_to_step_index(
+            timestep_value,
+            num_train_timesteps=num_train_timesteps,
+            reference_step_count=reference_step_count,
+        )
+        == target_step_index
+    ]
+    if not matching_timesteps:
+        raise TimestepRoutingError(
+            f"Unable to resolve a deterministic timestep for {normalized_band_name!r} at step_index={target_step_index}"
+        )
+    return int(matching_timesteps[len(matching_timesteps) // 2])
+
+
 def resolve_timestep_band_name_for_training_timesteps(
     routing_table: Mapping[str, Mapping[str, Sequence[int] | str]],
     *,
@@ -188,6 +224,7 @@ __all__ = [
     "build_timestep_band_routes",
     "describe_routing_table",
     "project_training_timestep_to_step_index",
+    "resolve_deterministic_timestep_for_band",
     "resolve_active_adapter_name_for_training_timesteps",
     "resolve_active_adapter_name",
     "resolve_timestep_band_name",

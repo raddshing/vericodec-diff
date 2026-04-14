@@ -98,10 +98,27 @@ def _primary_metric_rows(evaluation_dir: Path) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def _metric_for_backend(
+    rows_by_backend: Mapping[str, Mapping[str, Any]],
+    *,
+    backend: str,
+    metric_name: str,
+    invalid_reasons: list[str],
+) -> float | None:
+    row = rows_by_backend.get(backend)
+    if row is None:
+        invalid_reasons.append(f"Missing required baseline row for backend '{backend}'")
+        return None
+    if metric_name not in row or row.get(metric_name) in (None, ""):
+        invalid_reasons.append(f"primary_metric '{metric_name}' missing from backend row '{backend}'")
+        return None
+    return float(row[metric_name])
+
+
 def _wall_time_for_backend(rows: Sequence[Mapping[str, Any]], backend: str) -> float | None:
     for row in rows:
         if str(row["backend"]) == backend:
-            value = row.get("wall_time_seconds")
+            value = row.get("wall_time_sec")
             if value in (None, ""):
                 return None
             return float(value)
@@ -114,7 +131,7 @@ def _status_and_summary(
     thresholds: Mapping[str, Any],
     invalid_reasons: list[str],
 ) -> tuple[str, str]:
-    if invalid_reasons:
+    if invalid_reasons or any(value is None for value in metrics.values()):
         return "INVALID", "Gate input set is invalid."
 
     checks = [
@@ -186,6 +203,15 @@ def main() -> int:
     allocation_summary = _read_json(allocation_dir / "allocation_summary.json")
     evaluation_summary = _read_json(evaluation_dir / "evaluation_summary.json")
     baseline_rows = _primary_metric_rows(evaluation_dir)
+    primary_metric = str(config["policies"]["primary_metric"])
+    metric_names = evaluation_summary.get("metric_names")
+    evaluation_metric_names = (
+        [str(value) for value in metric_names]
+        if isinstance(metric_names, list)
+        else []
+    )
+    if primary_metric not in evaluation_metric_names:
+        invalid_reasons.append(f"primary_metric '{primary_metric}' not found in evaluation metric_names")
 
     backends_present = {str(row["backend"]) for row in baseline_rows}
     missing_backends = [backend for backend in required_backends if backend not in backends_present]
@@ -209,24 +235,48 @@ def main() -> int:
                 invalid_reasons.append(f"Forbidden mock/smoke token in recorded source path: {source_path}")
 
     baseline_by_backend = {str(row["backend"]): dict(row) for row in baseline_rows}
-    primary_metric = str(config["policies"]["primary_metric"])
-    uniform_metric = float(baseline_by_backend.get("uniform", {}).get(primary_metric, 0.0))
-    proposed_metric = float(baseline_by_backend.get("proposed", {}).get(primary_metric, 0.0))
-    best_ablation_metric = max(
-        float(baseline_by_backend.get("layer_only", {}).get(primary_metric, 0.0)),
-        float(baseline_by_backend.get("timestep_only", {}).get(primary_metric, 0.0)),
+    uniform_metric = _metric_for_backend(
+        baseline_by_backend,
+        backend="uniform",
+        metric_name=primary_metric,
+        invalid_reasons=invalid_reasons,
     )
-    denominator = max(abs(uniform_metric), 1.0e-8)
-    proposed_relative_vs_uniform = round((proposed_metric - uniform_metric) / denominator, 6)
+    proposed_metric = _metric_for_backend(
+        baseline_by_backend,
+        backend="proposed",
+        metric_name=primary_metric,
+        invalid_reasons=invalid_reasons,
+    )
+    layer_only_metric = _metric_for_backend(
+        baseline_by_backend,
+        backend="layer_only",
+        metric_name=primary_metric,
+        invalid_reasons=invalid_reasons,
+    )
+    timestep_only_metric = _metric_for_backend(
+        baseline_by_backend,
+        backend="timestep_only",
+        metric_name=primary_metric,
+        invalid_reasons=invalid_reasons,
+    )
+    best_ablation_metric = (
+        max(layer_only_metric, timestep_only_metric)
+        if layer_only_metric is not None and timestep_only_metric is not None
+        else None
+    )
+    proposed_relative_vs_uniform = None
+    if uniform_metric is not None and proposed_metric is not None:
+        denominator = max(abs(uniform_metric), 1.0e-8)
+        proposed_relative_vs_uniform = round((proposed_metric - uniform_metric) / denominator, 6)
     uniform_wall_time = _wall_time_for_backend(baseline_rows, "uniform")
     overhead_numerator = float(probe_summary.get("wall_time_seconds", 0.0)) + float(
         surrogate_summary.get("wall_time_seconds", 0.0)
     ) + float(allocation_summary.get("wall_time_seconds", 0.0))
-    probe_allocation_overhead_ratio = (
-        round(overhead_numerator / float(uniform_wall_time), 6)
-        if uniform_wall_time not in (None, 0.0)
-        else float("inf")
-    )
+    if uniform_wall_time is None or float(uniform_wall_time) == 0.0:
+        invalid_reasons.append("uniform wall_time_sec missing or zero")
+        probe_allocation_overhead_ratio = None
+    else:
+        probe_allocation_overhead_ratio = round(overhead_numerator / float(uniform_wall_time), 6)
 
     metrics = {
         "top_20_mass_ratio": _top_20_mass_ratio(probe_payload.get("rows", [])),
@@ -236,7 +286,11 @@ def main() -> int:
         "proposed_metric": proposed_metric,
         "uniform_metric": uniform_metric,
         "best_ablation_metric": best_ablation_metric,
-        "proposed_ge_best_ablation": proposed_metric >= best_ablation_metric,
+        "proposed_ge_best_ablation": (
+            proposed_metric >= best_ablation_metric
+            if proposed_metric is not None and best_ablation_metric is not None
+            else None
+        ),
         "probe_allocation_overhead_ratio": probe_allocation_overhead_ratio,
     }
     gate_status, decision_summary = _status_and_summary(

@@ -121,6 +121,9 @@ def main() -> int:
             "task": str(train_summary["task"]),
             "run_dir": str(run_dir),
         }
+        wall_time_sec = train_summary.get("wall_time_sec")
+        if isinstance(wall_time_sec, (int, float)) and not isinstance(wall_time_sec, bool):
+            row["wall_time_sec"] = float(wall_time_sec)
         for key, value in metrics.items():
             if isinstance(value, bool):
                 continue

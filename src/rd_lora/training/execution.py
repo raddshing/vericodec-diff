@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -1269,6 +1270,7 @@ def execute_training_run(
         )
     forced_timestep_band_index = 0
     forced_timestep_band_sequence_exhausted = False
+    train_loop_started_at = time.monotonic()
 
     while normalized_forced_timestep_band_sequence is not None or global_step < max_train_steps:
         components["unet"].train()
@@ -1387,6 +1389,7 @@ def execute_training_run(
             break
         if batches_in_epoch <= 0:
             raise TrainingExecutionError("train_dataloader must yield at least one batch")
+    train_loop_elapsed_sec = round(time.monotonic() - train_loop_started_at, 3)
 
     if global_step <= 0:
         raise TrainingExecutionError("Training exited without any optimizer steps")
@@ -1437,6 +1440,7 @@ def execute_training_run(
         "allocation_manifest": str(allocation_manifest_path),
         "train_steps": int(global_step),
         "checkpoint_path": str(last_checkpoint_path),
+        "wall_time_sec": train_loop_elapsed_sec,
     }
     write_success_artifacts(
         output_dir=output_dir_path,

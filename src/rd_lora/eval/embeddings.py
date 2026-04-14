@@ -103,6 +103,8 @@ def encode_images_clip(
                 inputs = processor(images=images, return_tensors="pt")
                 inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
                 features = model.get_image_features(**inputs)
+                if not isinstance(features, torch.Tensor):
+                    features = features.pooler_output if hasattr(features, 'pooler_output') else features[0]
                 features = torch.nn.functional.normalize(features.float(), p=2, dim=-1)
                 encoded_batches.append(features.cpu().numpy().astype(np.float32, copy=False))
         return np.concatenate(encoded_batches, axis=0)
@@ -156,6 +158,8 @@ def encode_texts_clip(
                 )
                 inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
                 features = model.get_text_features(**inputs)
+                if not isinstance(features, torch.Tensor):
+                    features = features.pooler_output if hasattr(features, 'pooler_output') else features[0]
                 features = torch.nn.functional.normalize(features.float(), p=2, dim=-1)
                 encoded_batches.append(features.cpu().numpy().astype(np.float32, copy=False))
         return np.concatenate(encoded_batches, axis=0)

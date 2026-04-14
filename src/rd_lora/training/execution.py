@@ -413,6 +413,36 @@ def assert_adapter_param_counts(unet: Any, adapter_names: list[str] | None) -> N
             )
 
 
+def upcast_trainable_params_to_fp32(torch_module: Any, trainable_parameters: Sequence[Any]) -> None:
+    seen_parameter_ids: set[int] = set()
+    for parameter in trainable_parameters:
+        parameter_id = id(parameter)
+        if parameter_id in seen_parameter_ids:
+            continue
+        seen_parameter_ids.add(parameter_id)
+        is_parameter_floating_point = getattr(parameter, "is_floating_point", None)
+        if callable(is_parameter_floating_point) and is_parameter_floating_point() and parameter.dtype != torch_module.float32:
+            parameter.data = parameter.data.to(dtype=torch_module.float32)
+        grad = getattr(parameter, "grad", None)
+        is_grad_floating_point = getattr(grad, "is_floating_point", None)
+        if grad is not None and callable(is_grad_floating_point) and is_grad_floating_point():
+            parameter.grad = parameter.grad.to(dtype=torch_module.float32)
+
+
+def assert_all_params_fp32(torch_module: Any, trainable_parameters: Sequence[Any]) -> None:
+    seen_parameter_ids: set[int] = set()
+    for parameter in trainable_parameters:
+        parameter_id = id(parameter)
+        if parameter_id in seen_parameter_ids:
+            continue
+        seen_parameter_ids.add(parameter_id)
+        is_parameter_floating_point = getattr(parameter, "is_floating_point", None)
+        if callable(is_parameter_floating_point) and is_parameter_floating_point() and parameter.dtype != torch_module.float32:
+            raise TrainingExecutionError(
+                "All floating-point trainable parameters must be float32 before optimizer creation"
+            )
+
+
 def collect_trainable_parameters(unet: Any, adapter_names: Sequence[str] | None = None) -> list[Any]:
     if adapter_names is not None and len(adapter_names) > 0:
         trainable = [
@@ -1170,10 +1200,10 @@ def execute_training_run(
     assert_adapter_param_counts(components["unet"], created_adapter_names)
     adapter_spec_by_name = _adapter_spec_lookup(adapter_specs)
     _assert_no_noop_adapter_specs(adapter_spec_by_name)
-    if training_args.mixed_precision == "fp16":
-        official_module.cast_training_params([components["unet"]], dtype=torch_module.float32)
-
     trainable_parameters = collect_trainable_parameters(components["unet"], adapter_names=created_adapter_names)
+    if training_args.mixed_precision == "fp16":
+        upcast_trainable_params_to_fp32(torch_module, trainable_parameters)
+    assert_all_params_fp32(torch_module, trainable_parameters)
     optimizer = create_optimizer(
         torch_module=torch_module,
         trainable_parameters=trainable_parameters,
@@ -1428,6 +1458,7 @@ __all__ = [
     "REQUIRED_SUCCESS_FILES",
     "TRAINING_SUCCESS_STATUS",
     "TrainingExecutionError",
+    "assert_all_params_fp32",
     "build_training_args",
     "assert_adapter_param_counts",
     "collect_trainable_parameters",
@@ -1439,6 +1470,7 @@ __all__ = [
     "execute_training_run",
     "load_torch",
     "save_checkpoint",
+    "upcast_trainable_params_to_fp32",
     "validate_training_output_artifacts",
     "write_success_artifacts",
 ]

@@ -18,7 +18,7 @@ from rd_lora.eval.score import subject_score
 
 def _list_reference_images(reference_image_dir: Path) -> list[Path]:
     reference_paths: list[Path] = []
-    for pattern in ("*.png", "*.jpg", "*.jpeg"):
+    for pattern in ("*.png", "*.jpg", "*.jpeg", "*.ppm"):
         reference_paths.extend(path for path in reference_image_dir.glob(pattern) if path.is_file())
     return sorted(reference_paths)
 
